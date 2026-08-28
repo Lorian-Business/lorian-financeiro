@@ -221,8 +221,10 @@ let state = {
   filterRecStatus:'all',
   editingId:null,
   modalOpen:false,
+  modalBusy:false,
   configOpen:false,
   scriptUrl:'',
+  scriptToken:'',
   syncState:'idle',   // idle | syncing | ok | error | offline
   lastSync:null,
 };
@@ -245,57 +247,93 @@ function showToast(msg){
 /* ---------------- armazenamento ----------------
    Camada 1 (sempre): cache neste navegador (localStorage) — nunca perde o que
    você digitou neste aparelho, mesmo sem internet.
-   Camada 2 (ao clicar em "Salvar/Exportar"): sincroniza com a planilha Google
-   configurada, para os outros sócios verem os mesmos dados.
+   Camada 2 (ao clicar em "Salvar" ou "Exportar"): sincroniza com a planilha
+   Google configurada, para os outros sócios verem os mesmos dados.
 ------------------------------------------------- */
 function cacheLocally(){
   try{
-    localStorage.setItem(CACHE_KEY, JSON.stringify({transactions:state.transactions, history:state.history}));
+    localStorage.setItem(CACHE_KEY, JSON.stringify({transactions:state.transactions, history:state.history, dirty:!!state.dirty}));
   }catch(e){ /* armazenamento local indisponível — segue só em memória */ }
 }
 function loadLocalCache(){
   try{
     const raw = localStorage.getItem(CACHE_KEY);
-    if(raw){ const c = JSON.parse(raw); state.transactions = c.transactions||[]; state.history = c.history||[]; }
+    if(raw){ const c = JSON.parse(raw); state.transactions = c.transactions||[]; state.history = c.history||[]; state.dirty = !!c.dirty; }
   }catch(e){ /* ignora cache corrompido */ }
 }
-function loadConfig(){
-  try{ state.scriptUrl = localStorage.getItem(CONFIG_KEY) || ''; }catch(e){ state.scriptUrl=''; }
+// Chame isto (em vez de cacheLocally direto) sempre que o USUÁRIO alterar algo
+// localmente — marca que este aparelho tem mudanças ainda não enviadas à
+// planilha, para o app nunca as sobrescrever sozinho ao recarregar.
+function touch(){
+  state.dirty = true;
+  cacheLocally();
 }
-function saveConfig(url){
+function loadConfig(){
+  try{
+    const raw = localStorage.getItem(CONFIG_KEY);
+    const c = raw ? JSON.parse(raw) : {};
+    state.scriptUrl = c.url || '';
+    state.scriptToken = c.token || '';
+  }catch(e){ state.scriptUrl=''; state.scriptToken=''; }
+}
+function saveConfig(url, token){
   state.scriptUrl = url.trim();
-  try{ localStorage.setItem(CONFIG_KEY, state.scriptUrl); }catch(e){}
+  state.scriptToken = token.trim();
+  try{ localStorage.setItem(CONFIG_KEY, JSON.stringify({url:state.scriptUrl, token:state.scriptToken})); }catch(e){}
+}
+function buildUrl_(){
+  if(!state.scriptUrl) return '';
+  const sep = state.scriptUrl.includes('?') ? '&' : '?';
+  return state.scriptUrl + sep + 'token=' + encodeURIComponent(state.scriptToken||'');
 }
 
 async function init(){
-  loadConfig();
-  loadLocalCache();
-  state.dataLoaded = true;
-  render();
-  if(state.scriptUrl){
-    refreshFromServer(true);
-  }else{
-    state.configOpen = true;
+  try{
+    loadConfig();
+    loadLocalCache();
+    state.dataLoaded = true;
     render();
+    if(state.scriptUrl){
+      if(state.dirty){
+        // há mudanças feitas neste aparelho que ainda não foram enviadas —
+        // NUNCA sobrescrever sozinho com o que está na planilha.
+        state.syncState = 'error';
+        showToast('Você tem lançamentos deste aparelho ainda não sincronizados. Clique em "Salvar / Exportar" para enviá-los antes de atualizar.');
+        render();
+      }else{
+        refreshFromServer(true);
+      }
+    }else{
+      state.configOpen = true;
+      render();
+    }
+  }catch(e){
+    document.getElementById('app').innerHTML =
+      '<div class="loading">Ocorreu um erro ao carregar o app. Recarregue a página. ('+(e&&e.message?e.message:e)+')</div>';
   }
 }
 
 async function refreshFromServer(silent){
   if(!state.scriptUrl) return;
+  if(!silent && state.dirty){
+    const proceed = confirm('Você tem alterações não sincronizadas neste aparelho. Atualizar agora vai SUBSTITUÍ-LAS pelos dados da planilha. Deseja continuar mesmo assim?');
+    if(!proceed) return;
+  }
   state.syncState = 'syncing'; render();
   try{
-    const res = await fetch(state.scriptUrl, {method:'GET'});
-    if(!res.ok) throw new Error('HTTP '+res.status);
+    const res = await fetch(buildUrl_(), {method:'GET'});
     const data = await res.json();
+    if(!res.ok || data.ok===false || data.error) throw new Error(data.error || ('HTTP '+res.status));
     state.transactions = (data.transactions||[]).map(normalizeTx);
     state.history = (data.history||[]).map(normalizeHist);
+    state.dirty = false;
     cacheLocally();
     state.syncState = 'ok';
     state.lastSync = new Date().toISOString();
     if(!silent) showToast('Dados atualizados com a planilha compartilhada.');
   }catch(e){
     state.syncState = 'error';
-    if(!silent) showToast('Não foi possível conectar à planilha. Mostrando a última cópia salva neste aparelho.');
+    showToast('Não foi possível ler a planilha (' + e.message + '). Mostrando a última cópia salva neste aparelho.');
   }
   render();
 }
@@ -307,12 +345,14 @@ async function pushToServer(){
   }
   state.syncState = 'syncing'; render();
   try{
-    const res = await fetch(state.scriptUrl, {
+    const res = await fetch(buildUrl_(), {
       method:'POST',
       headers:{'Content-Type':'text/plain;charset=utf-8'}, // evita preflight CORS no Apps Script
       body: JSON.stringify({transactions:state.transactions, history:state.history}),
     });
-    if(!res.ok) throw new Error('HTTP '+res.status);
+    const data = await res.json().catch(()=>({}));
+    if(!res.ok || data.ok===false) throw new Error(data.error || ('HTTP '+res.status));
+    state.dirty = false;
     cacheLocally();
     state.syncState = 'ok';
     state.lastSync = new Date().toISOString();
@@ -322,7 +362,7 @@ async function pushToServer(){
     state.syncState = 'error';
     cacheLocally();
     render();
-    showToast('Não foi possível enviar para a planilha. Os dados ficaram salvos apenas neste aparelho — tente novamente.');
+    showToast('Não sincronizou com a planilha (' + e.message + '). Os dados ficaram salvos apenas neste aparelho.');
     return false;
   }
 }
@@ -433,12 +473,13 @@ function renderHeader(){
     </nav>
     <div class="topbar-actions">
       ${syncBadge()}
-      <button class="btn btn-sm btn-ghost" id="refreshBtn" title="Buscar dados mais recentes da planilha">↻</button>
+      <button class="btn btn-sm btn-ghost" id="refreshBtn" title="Buscar dados mais recentes da planilha" ${state.syncState==='syncing'?'disabled':''}>↻</button>
       <select id="periodSelect">
         <option value="all" ${state.period==='all'?'selected':''}>Todo o período</option>
         ${months.map(m=>`<option value="${m}" ${state.period===m?'selected':''}>${monthLabel(m)}</option>`).join('')}
       </select>
-      <button class="btn btn-gold" id="openModalBtn">Salvar / Exportar</button>
+      <button class="btn btn-ghost" id="exportBtn" ${state.syncState==='syncing'?'disabled':''}>Exportar Excel</button>
+      <button class="btn btn-gold" id="openModalBtn" ${state.syncState==='syncing'?'disabled':''}>${state.syncState==='syncing'?'Salvando…':'Salvar'}</button>
       <button class="btn btn-sm btn-ghost" id="openConfigBtn" title="Configurar conexão com a planilha">⚙</button>
     </div>
   </div></header>`;
@@ -592,7 +633,7 @@ function attachTabEvents(){
         showToast('Lançamento adicionado.');
       }
       state.editingId = null;
-      cacheLocally(); render();
+      touch(); render();
     });
     const cancelBtn = document.getElementById('cancelEdit');
     if(cancelBtn) cancelBtn.addEventListener('click', ()=>{ state.editingId=null; render(); });
@@ -601,7 +642,7 @@ function attachTabEvents(){
     document.querySelectorAll('[data-del]').forEach(b=>b.addEventListener('click',()=>{
       if(confirm('Excluir este lançamento?')){
         state.transactions = state.transactions.filter(t=>t.id!==b.dataset.del);
-        cacheLocally(); render();
+        touch(); render();
       }
     }));
     document.getElementById('filterType').addEventListener('change', e=>{ state.filterType=e.target.value; render(); });
@@ -609,6 +650,7 @@ function attachTabEvents(){
   }
 
   if(state.activeTab==='conciliacao') attachConciliacaoEvents();
+  if(state.activeTab==='historico') attachHistoricoEvents();
 }
 
 /* ================= CONCILIAÇÃO ================= */
@@ -664,12 +706,12 @@ function attachConciliacaoEvents(){
   document.querySelectorAll('[data-toggle]').forEach(b=>b.addEventListener('click', ()=>{
     const t = state.transactions.find(t=>t.id===b.dataset.toggle);
     t.reconciled = !t.reconciled;
-    cacheLocally(); render();
+    touch(); render();
   }));
   document.querySelectorAll('[data-note]').forEach(inp=>inp.addEventListener('change', ()=>{
     const t = state.transactions.find(t=>t.id===inp.dataset.note);
     t.bankNote = inp.value;
-    cacheLocally();
+    touch();
   }));
 }
 
@@ -812,11 +854,17 @@ function renderHistorico(){
   const list = [...state.history].sort((a,b)=> b.timestamp.localeCompare(a.timestamp));
   return `
   <section class="card">
-    <h2 class="section-title">Histórico de salvamentos e exportações</h2>
-    <p class="section-sub">Todo clique em "Salvar" ou "Exportar" fica registrado aqui, com um snapshot dos totais do momento — visível para os três sócios.</p>
+    <div class="toolbar">
+      <div>
+        <h2 class="section-title" style="margin-bottom:2px;">Histórico de salvamentos e exportações</h2>
+        <p class="section-sub" style="margin-bottom:0;">Todo clique em "Salvar" ou "Exportar" fica registrado aqui — visível para os três sócios após sincronizar.</p>
+      </div>
+      <div class="spacer"></div>
+      ${list.length>0?`<button class="btn btn-sm btn-danger-ghost" id="clearHistBtn">Limpar histórico</button>`:''}
+    </div>
     ${list.length===0? `<div class="empty">Nenhum registro ainda. Use o botão "Salvar / Exportar" no topo da página.</div>` : `
     <table>
-      <thead><tr><th>Quando</th><th>Ação</th><th>Período</th><th class="num">Lançamentos</th><th class="num">Faturamento</th><th class="num">Despesas</th><th class="num">Lucro Líquido</th><th>Observação</th></tr></thead>
+      <thead><tr><th>Quando</th><th>Ação</th><th>Período</th><th class="num">Lançamentos</th><th class="num">Faturamento</th><th class="num">Despesas</th><th class="num">Lucro Líquido</th><th>Observação</th><th></th></tr></thead>
       <tbody>
         ${list.map(h=>`
           <tr>
@@ -828,54 +876,86 @@ function renderHistorico(){
             <td class="num" style="color:var(--red)">${fmtMoney(h.despesasTotais)}</td>
             <td class="num">${fmtMoney(h.lucroLiquido)}</td>
             <td>${h.note||'<span style="color:var(--text-dim)">—</span>'}</td>
+            <td><button class="btn btn-sm btn-danger-ghost" data-del-hist="${h.id}">Excluir</button></td>
           </tr>`).join('')}
       </tbody>
     </table>`}
   </section>`;
 }
+function attachHistoricoEvents(){
+  document.querySelectorAll('[data-del-hist]').forEach(b=>b.addEventListener('click', ()=>{
+    if(confirm('Excluir este registro do histórico?')){
+      state.history = state.history.filter(h=>h.id!==b.dataset.delHist);
+      touch(); render();
+    }
+  }));
+  const clearBtn = document.getElementById('clearHistBtn');
+  if(clearBtn) clearBtn.addEventListener('click', ()=>{
+    if(confirm('Apagar TODO o histórico de salvamentos/exportações? Isso não afeta os lançamentos.')){
+      state.history = [];
+      touch(); render();
+    }
+  });
+}
 
 /* ================= MODAL: SALVAR / EXPORTAR ================= */
 function renderModal(){
   if(!state.modalOpen) return `<div class="modal-overlay hidden"></div>`;
+  const list = periodTransactions();
+  const d = dreData(list);
+  const periodLabel = state.period==='all' ? 'todo o período' : monthLabel(state.period);
+  const busy = !!state.modalBusy;
   return `
   <div class="modal-overlay" id="modalOverlay">
     <div class="modal">
       <h3>Salvar ou exportar?</h3>
-      <p>Isso grava um snapshot no histórico compartilhado (visível para os 3 sócios). Exportar também baixa a planilha Excel.</p>
+      <p class="section-sub" style="margin-bottom:12px;">
+        Isso vai enviar <strong>${list.length} lançamento(s)</strong> de <strong>${periodLabel}</strong>
+        (faturamento ${fmtMoney(d.receitaBruta)}, lucro líquido ${fmtMoney(d.lucroLiquido)})
+        para a planilha compartilhada. Confira antes de confirmar.
+      </p>
       <div class="field">
         <label>Observação (opcional)</label>
-        <input type="text" id="modalNote" placeholder="Ex: Fechamento de agosto">
+        <input type="text" id="modalNote" placeholder="Ex: Fechamento de agosto" ${busy?'disabled':''}>
       </div>
-      <button class="btn btn-block modal-option" id="modalSaveOnly">
-        <div class="opt-title">Apenas salvar no histórico</div>
+      <button class="btn btn-block modal-option" id="modalSaveOnly" ${busy?'disabled style="opacity:.55"':''}>
+        <div class="opt-title">${busy==='salvar'?'Salvando…':'Apenas salvar no histórico'}</div>
         <div class="opt-sub">Registra o snapshot, sem baixar arquivo</div>
       </button>
-      <button class="btn btn-gold btn-block modal-option gold" id="modalExport">
-        <div class="opt-title">Salvar e exportar Excel</div>
+      <button class="btn btn-gold btn-block modal-option gold" id="modalExport" ${busy?'disabled style="opacity:.55"':''}>
+        <div class="opt-title">${busy==='exportar'?'Salvando e exportando…':'Salvar e exportar Excel'}</div>
         <div class="opt-sub">Registra o snapshot e baixa a planilha para a contabilidade</div>
       </button>
       <div class="modal-cancel-row">
-        <button class="btn btn-ghost btn-sm" id="modalCancel">Cancelar</button>
+        <button class="btn btn-ghost btn-sm" id="modalCancel" ${busy?'disabled':''}>Cancelar</button>
       </div>
     </div>
   </div>`;
 }
 function attachModalEvents(){
-  document.getElementById('modalOverlay').addEventListener('click', e=>{ if(e.target.id==='modalOverlay'){ state.modalOpen=false; render(); } });
-  document.getElementById('modalCancel').addEventListener('click', ()=>{ state.modalOpen=false; render(); });
-  document.getElementById('modalSaveOnly').addEventListener('click', async ()=>{
+  document.getElementById('modalOverlay').addEventListener('click', e=>{ if(e.target.id==='modalOverlay' && !state.modalBusy){ state.modalOpen=false; render(); } });
+  const cancelBtn = document.getElementById('modalCancel');
+  if(cancelBtn) cancelBtn.addEventListener('click', ()=>{ if(state.modalBusy) return; state.modalOpen=false; render(); });
+
+  const saveBtn = document.getElementById('modalSaveOnly');
+  const exportBtn = document.getElementById('modalExport');
+  if(saveBtn) saveBtn.addEventListener('click', async ()=>{
+    if(state.modalBusy) return;
     const note = document.getElementById('modalNote').value.trim();
+    state.modalBusy = 'salvar'; render();
     recordHistory('salvar', note);
-    state.modalOpen=false; render();
     const ok = await pushToServer();
+    state.modalBusy = false; state.modalOpen = false; render();
     showToast(ok ? 'Salvo e sincronizado com a planilha.' : 'Salvo neste aparelho — sincronização falhou.');
   });
-  document.getElementById('modalExport').addEventListener('click', async ()=>{
+  if(exportBtn) exportBtn.addEventListener('click', async ()=>{
+    if(state.modalBusy) return;
     const note = document.getElementById('modalNote').value.trim();
+    state.modalBusy = 'exportar'; render();
     recordHistory('exportar', note);
-    state.modalOpen=false; render();
     const ok = await pushToServer();
     exportExcel();
+    state.modalBusy = false; state.modalOpen = false; render();
     showToast(ok ? 'Exportado e sincronizado com a planilha.' : 'Excel exportado, mas a sincronização falhou.');
   });
 }
@@ -896,7 +976,7 @@ function recordHistory(action, note){
     note: note || '',
   };
   state.history.unshift(entry);
-  cacheLocally();
+  touch();
   return entry;
 }
 
@@ -907,12 +987,18 @@ function renderConfigModal(){
   <div class="modal-overlay" id="configOverlay">
     <div class="modal">
       <h3>Conectar à planilha compartilhada</h3>
-      <p>Cole aqui a URL do Web App do Google Apps Script (veja o guia de instalação). Isso conecta este app à planilha Google que guarda os dados de verdade, compartilhada pelos 3 sócios.</p>
+      <p>Cole a URL do Web App <strong>e</strong> o token secreto, separados (veja o guia de instalação). Isso conecta o app à planilha Google que guarda os dados de verdade, compartilhada pelos 3 sócios.</p>
       <div class="field">
         <label>URL do Web App</label>
         <input type="text" id="configUrlInput" value="${state.scriptUrl}" placeholder="https://script.google.com/macros/s/…/exec">
       </div>
-      <button class="btn btn-gold btn-block" id="configSaveBtn" style="margin-bottom:10px;">Salvar e sincronizar agora</button>
+      <div class="field">
+        <label>Token secreto</label>
+        <input type="text" id="configTokenInput" value="${state.scriptToken}" placeholder="o mesmo SECRET_TOKEN definido no script">
+      </div>
+      <button class="btn btn-gold btn-block" id="configTestBtn" style="margin-bottom:8px;">Testar conexão</button>
+      <button class="btn btn-block" id="configSaveBtn" style="margin-bottom:10px;">Salvar e sincronizar agora</button>
+      <div id="configResult" style="font-size:12.5px;color:var(--text-dim);min-height:18px;margin-bottom:4px;"></div>
       <div class="modal-cancel-row">
         <button class="btn btn-ghost btn-sm" id="configCancel">Fechar</button>
       </div>
@@ -922,16 +1008,53 @@ function renderConfigModal(){
 function attachConfigEvents(){
   document.getElementById('configOverlay').addEventListener('click', e=>{ if(e.target.id==='configOverlay'){ state.configOpen=false; render(); } });
   document.getElementById('configCancel').addEventListener('click', ()=>{ state.configOpen=false; render(); });
+
+  document.getElementById('configTestBtn').addEventListener('click', async ()=>{
+    const url = document.getElementById('configUrlInput').value.trim();
+    const token = document.getElementById('configTokenInput').value.trim();
+    const box = document.getElementById('configResult');
+    if(!url || !token){ box.textContent = 'Preencha URL e token antes de testar.'; box.style.color='var(--red)'; return; }
+    box.textContent = 'Testando…'; box.style.color = 'var(--text-dim)';
+    try{
+      const sep = url.includes('?') ? '&' : '?';
+      const res = await fetch(url + sep + 'token=' + encodeURIComponent(token));
+      const data = await res.json();
+      if(data.ok===false || data.error) throw new Error(data.error||'acesso negado');
+      box.textContent = `Conectado! ${(data.transactions||[]).length} lançamento(s) e ${(data.history||[]).length} registro(s) de histórico encontrados na planilha.`;
+      box.style.color = 'var(--green)';
+    }catch(e){
+      box.textContent = 'Falha: ' + e.message + '. Confira se o token bate com o SECRET_TOKEN do script e se você reimplantou uma "Nova versão" depois de editar.';
+      box.style.color = 'var(--red)';
+    }
+  });
+
   document.getElementById('configSaveBtn').addEventListener('click', async ()=>{
     const url = document.getElementById('configUrlInput').value.trim();
-    if(!url){ showToast('Cole a URL do Web App antes de salvar.'); return; }
-    saveConfig(url);
+    const token = document.getElementById('configTokenInput').value.trim();
+    if(!url || !token){ showToast('Preencha a URL e o token antes de salvar.'); return; }
+    saveConfig(url, token);
     state.configOpen = false; render();
     await refreshFromServer(false);
   });
 }
 
 /* ================= EXPORT EXCEL ================= */
+const CURRENCY_FMT = '"R$" #,##0.00';
+
+// Aplica formato de moeda a colunas específicas (por rótulo do cabeçalho) de
+// uma planilha gerada por XLSX.utils.json_to_sheet.
+function applyCurrencyFormat_(ws, headerLabels, moneyLabels, numRows){
+  moneyLabels.forEach(label=>{
+    const colIdx = headerLabels.indexOf(label);
+    if(colIdx===-1) return;
+    const colLetter = XLSX.utils.encode_col(colIdx);
+    for(let r=0;r<numRows;r++){
+      const ref = colLetter + (r+2); // +2: linha 1 é o cabeçalho
+      if(ws[ref]) ws[ref].z = CURRENCY_FMT;
+    }
+  });
+}
+
 function exportExcel(){
   const list = periodTransactions().sort((a,b)=>a.date.localeCompare(b.date));
   if(list.length===0){ showToast('Não há lançamentos para exportar neste período.'); return; }
@@ -948,8 +1071,32 @@ function exportExcel(){
     'Conciliado': t.reconciled?'Sim':'Não',
     'Nota do Extrato': t.bankNote||'',
   }));
-  const ws = XLSX.utils.json_to_sheet(rows);
+  const txHeaders = ['Data','Tipo','Categoria','Descrição','Nº NF','Valor','Forma de Pagamento','Sócio','Conciliado','Nota do Extrato'];
+  const ws = XLSX.utils.json_to_sheet(rows, {header:txHeaders});
   ws['!cols'] = [{wch:11},{wch:9},{wch:24},{wch:32},{wch:10},{wch:12},{wch:16},{wch:14},{wch:11},{wch:18}];
+  applyCurrencyFormat_(ws, txHeaders, ['Valor'], rows.length);
+
+  // Resumo mensal — visão geral de TODOS os meses lançados, independente do
+  // filtro de período selecionado no momento da exportação.
+  const monthsAll = Array.from(new Set(state.transactions.map(t=>t.date.slice(0,7)))).sort();
+  const resumoRows = monthsAll.map(m=>{
+    const mt = state.transactions.filter(t=>t.date.slice(0,7)===m);
+    const d = dreData(mt);
+    return {
+      'Mês': monthLabel(m),
+      'Faturamento': d.receitaBruta,
+      'Deduções': d.deducoes,
+      'CMV': d.cmv,
+      'Despesas Operacionais': d.opex,
+      'Retiradas': d.naoOperacional,
+      'Lucro Líquido': d.lucroLiquido,
+      'Lançamentos': mt.length,
+    };
+  });
+  const resumoHeaders = ['Mês','Faturamento','Deduções','CMV','Despesas Operacionais','Retiradas','Lucro Líquido','Lançamentos'];
+  const wsResumo = XLSX.utils.json_to_sheet(resumoRows, {header:resumoHeaders});
+  wsResumo['!cols'] = [{wch:16},{wch:14},{wch:12},{wch:12},{wch:20},{wch:12},{wch:14},{wch:12}];
+  applyCurrencyFormat_(wsResumo, resumoHeaders, ['Faturamento','Deduções','CMV','Despesas Operacionais','Retiradas','Lucro Líquido'], resumoRows.length);
 
   const histRows = [...state.history].sort((a,b)=>b.timestamp.localeCompare(a.timestamp)).map(h=>({
     'Quando': fmtDateTime(h.timestamp),
@@ -961,11 +1108,14 @@ function exportExcel(){
     'Lucro Líquido': h.lucroLiquido,
     'Observação': h.note||'',
   }));
-  const wsHist = XLSX.utils.json_to_sheet(histRows);
+  const histHeaders = ['Quando','Ação','Período','Lançamentos','Faturamento','Despesas','Lucro Líquido','Observação'];
+  const wsHist = XLSX.utils.json_to_sheet(histRows, {header:histHeaders});
   wsHist['!cols'] = [{wch:17},{wch:10},{wch:16},{wch:12},{wch:14},{wch:14},{wch:14},{wch:26}];
+  applyCurrencyFormat_(wsHist, histHeaders, ['Faturamento','Despesas','Lucro Líquido'], histRows.length);
 
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Lançamentos');
+  XLSX.utils.book_append_sheet(wb, wsResumo, 'Resumo Mensal');
   XLSX.utils.book_append_sheet(wb, wsHist, 'Histórico');
 
   const label = state.period==='all' ? 'todos' : state.period;
