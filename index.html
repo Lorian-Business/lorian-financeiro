@@ -185,24 +185,42 @@
    LORIAN · FINANCEIRO — dados compartilhados entre socios
    ========================================================= */
 
-const CATEGORIES = [
-  {id:'vendas_ml',        label:'Vendas Mercado Livre',        type:'receita', group:'receita'},
-  {id:'vendas_shopee',    label:'Vendas Shopee',                type:'receita', group:'receita'},
-  {id:'outras_receitas',  label:'Outras Receitas',              type:'receita', group:'receita'},
-  {id:'impostos_vendas',  label:'Impostos sobre Vendas',        type:'despesa', group:'deducao'},
-  {id:'cmv',              label:'Custo de Mercadoria (CMV)',    type:'despesa', group:'cmv'},
-  {id:'frete',            label:'Frete e Logística',            type:'despesa', group:'operacional'},
-  {id:'taxas_marketplace',label:'Taxas de Marketplace',         type:'despesa', group:'operacional'},
-  {id:'marketing',        label:'Marketing e Publicidade',      type:'despesa', group:'operacional'},
-  {id:'ferramentas',      label:'Ferramentas e Assinaturas',    type:'despesa', group:'operacional'},
-  {id:'administrativo',   label:'Despesas Administrativas',     type:'despesa', group:'operacional'},
-  {id:'outras_despesas',  label:'Outras Despesas',              type:'despesa', group:'operacional'},
-  {id:'retirada_socio',   label:'Retirada de Sócio',            type:'despesa', group:'nao_operacional'},
-];
+const CATEGORY_PRESETS = {
+  ecommerce: [
+    {id:'vendas_ml',        label:'Vendas Mercado Livre',        type:'receita', group:'receita'},
+    {id:'vendas_shopee',    label:'Vendas Shopee',                type:'receita', group:'receita'},
+    {id:'outras_receitas',  label:'Outras Receitas',              type:'receita', group:'receita'},
+    {id:'impostos_vendas',  label:'Impostos sobre Vendas',        type:'despesa', group:'deducao'},
+    {id:'cmv',              label:'Custo de Mercadoria (CMV)',    type:'despesa', group:'cmv'},
+    {id:'frete',            label:'Frete e Logística',            type:'despesa', group:'operacional'},
+    {id:'taxas_marketplace',label:'Taxas de Marketplace',         type:'despesa', group:'operacional'},
+    {id:'marketing',        label:'Marketing e Publicidade',      type:'despesa', group:'operacional'},
+    {id:'ferramentas',      label:'Ferramentas e Assinaturas',    type:'despesa', group:'operacional'},
+    {id:'administrativo',   label:'Despesas Administrativas',     type:'despesa', group:'operacional'},
+    {id:'outras_despesas',  label:'Outras Despesas',              type:'despesa', group:'operacional'},
+    {id:'retirada_socio',   label:'Retirada de Sócio',            type:'despesa', group:'nao_operacional'},
+  ],
+  servicos: [
+    {id:'honorarios',       label:'Honorários de Consultoria',    type:'receita', group:'receita'},
+    {id:'outras_receitas',  label:'Outras Receitas',              type:'receita', group:'receita'},
+    {id:'impostos_servicos',label:'Impostos sobre Serviços',      type:'despesa', group:'deducao'},
+    {id:'custos_projeto',   label:'Custos Diretos do Projeto',    type:'despesa', group:'cmv'},
+    {id:'marketing',        label:'Marketing e Publicidade',      type:'despesa', group:'operacional'},
+    {id:'ferramentas',      label:'Ferramentas e Assinaturas',    type:'despesa', group:'operacional'},
+    {id:'administrativo',   label:'Despesas Administrativas',     type:'despesa', group:'operacional'},
+    {id:'outras_despesas',  label:'Outras Despesas',              type:'despesa', group:'operacional'},
+    {id:'retirada_socio',   label:'Retirada (Pró-labore)',        type:'despesa', group:'nao_operacional'},
+  ],
+};
+let CATEGORIES = CATEGORY_PRESETS.ecommerce; // reatribuído ao trocar de área de trabalho
+
 const PAYMENT_METHODS = ['Pix','Transferência','Boleto','Cartão','Dinheiro'];
 const MONTH_NAMES = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
-const CACHE_KEY = 'lorian_cache_v1';       // cópia local no navegador (nunca perde dados neste dispositivo)
-const CONFIG_KEY = 'lorian_config_v1';     // URL do Google Apps Script conectado
+
+// Cada "área de trabalho" (Lorian, Consultoria, etc.) tem sua própria planilha
+// (URL + token) e seu próprio cache local — são mundos totalmente separados.
+const WORKSPACES_KEY = 'lorian_workspaces_v1';
+const cacheKeyFor = wsId => `lorian_cache_${wsId}`;
 
 let state = {
   dataLoaded:false,
@@ -217,11 +235,13 @@ let state = {
   modalOpen:false,
   modalBusy:false,
   configOpen:false,
-  scriptUrl:'',
-  scriptToken:'',
+  configEditingId:null,   // qual área está sendo editada/criada no modal, se houver
+  workspaces:[],          // [{id,name,scriptUrl,scriptToken,categoryPreset}]
+  activeWorkspaceId:'',
   syncState:'idle',   // idle | syncing | ok | error | offline
   lastSync:null,
 };
+const activeWorkspace = () => state.workspaces.find(w=>w.id===state.activeWorkspaceId) || null;
 
 const catById = id => CATEGORIES.find(c=>c.id===id);
 const fmtMoney = v => (v<0?'-':'') + 'R$ ' + Math.abs(v).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2});
