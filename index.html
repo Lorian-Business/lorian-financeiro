@@ -259,19 +259,23 @@ function showToast(msg){
 }
 
 /* ---------------- armazenamento ----------------
-   Camada 1 (sempre): cache neste navegador (localStorage) — nunca perde o que
-   você digitou neste aparelho, mesmo sem internet.
+   Camada 1 (sempre): cache neste navegador (localStorage), por área de
+   trabalho — nunca perde o que você digitou neste aparelho, mesmo sem
+   internet.
    Camada 2 (ao clicar em "Salvar" ou "Exportar"): sincroniza com a planilha
-   Google configurada, para os outros sócios verem os mesmos dados.
+   Google daquela área específica.
 ------------------------------------------------- */
 function cacheLocally(){
+  if(!state.activeWorkspaceId) return;
   try{
-    localStorage.setItem(CACHE_KEY, JSON.stringify({transactions:state.transactions, history:state.history, dirty:!!state.dirty}));
+    localStorage.setItem(cacheKeyFor(state.activeWorkspaceId), JSON.stringify({transactions:state.transactions, history:state.history, dirty:!!state.dirty}));
   }catch(e){ /* armazenamento local indisponível — segue só em memória */ }
 }
 function loadLocalCache(){
+  state.transactions = []; state.history = []; state.dirty = false;
+  if(!state.activeWorkspaceId) return;
   try{
-    const raw = localStorage.getItem(CACHE_KEY);
+    const raw = localStorage.getItem(cacheKeyFor(state.activeWorkspaceId));
     if(raw){ const c = JSON.parse(raw); state.transactions = c.transactions||[]; state.history = c.history||[]; state.dirty = !!c.dirty; }
   }catch(e){ /* ignora cache corrompido */ }
 }
@@ -282,32 +286,56 @@ function touch(){
   state.dirty = true;
   cacheLocally();
 }
-function loadConfig(){
+
+function loadWorkspaces(){
   try{
-    const raw = localStorage.getItem(CONFIG_KEY);
-    const c = raw ? JSON.parse(raw) : {};
-    state.scriptUrl = c.url || '';
-    state.scriptToken = c.token || '';
-  }catch(e){ state.scriptUrl=''; state.scriptToken=''; }
+    const raw = localStorage.getItem(WORKSPACES_KEY);
+    state.workspaces = raw ? JSON.parse(raw) : [];
+  }catch(e){ state.workspaces = []; }
+  // área ativa lembrada separadamente, também por navegador
+  try{ state.activeWorkspaceId = localStorage.getItem(WORKSPACES_KEY+'_active') || (state.workspaces[0]?state.workspaces[0].id:''); }
+  catch(e){ state.activeWorkspaceId = state.workspaces[0]?state.workspaces[0].id:''; }
 }
-function saveConfig(url, token){
-  state.scriptUrl = url.trim();
-  state.scriptToken = token.trim();
-  try{ localStorage.setItem(CONFIG_KEY, JSON.stringify({url:state.scriptUrl, token:state.scriptToken})); }catch(e){}
+function saveWorkspacesList(){
+  try{ localStorage.setItem(WORKSPACES_KEY, JSON.stringify(state.workspaces)); }catch(e){}
+}
+function setActiveWorkspace(id){
+  state.activeWorkspaceId = id;
+  try{ localStorage.setItem(WORKSPACES_KEY+'_active', id); }catch(e){}
+  const ws = activeWorkspace();
+  CATEGORIES = CATEGORY_PRESETS[ws?.categoryPreset] || CATEGORY_PRESETS.ecommerce;
+  state.filterCategory = 'all';
+  loadLocalCache();
+}
+function upsertWorkspace(ws){
+  const idx = state.workspaces.findIndex(w=>w.id===ws.id);
+  if(idx===-1) state.workspaces.push(ws); else state.workspaces[idx]=ws;
+  saveWorkspacesList();
+}
+function removeWorkspace(id){
+  state.workspaces = state.workspaces.filter(w=>w.id!==id);
+  saveWorkspacesList();
+  try{ localStorage.removeItem(cacheKeyFor(id)); }catch(e){}
+  if(state.activeWorkspaceId===id){
+    setActiveWorkspace(state.workspaces[0] ? state.workspaces[0].id : '');
+  }
 }
 function buildUrl_(){
-  if(!state.scriptUrl) return '';
-  const sep = state.scriptUrl.includes('?') ? '&' : '?';
-  return state.scriptUrl + sep + 'token=' + encodeURIComponent(state.scriptToken||'');
+  const ws = activeWorkspace();
+  if(!ws || !ws.scriptUrl) return '';
+  const sep = ws.scriptUrl.includes('?') ? '&' : '?';
+  return ws.scriptUrl + sep + 'token=' + encodeURIComponent(ws.scriptToken||'');
 }
 
 async function init(){
   try{
-    loadConfig();
+    loadWorkspaces();
+    const ws = activeWorkspace();
+    CATEGORIES = CATEGORY_PRESETS[ws?.categoryPreset] || CATEGORY_PRESETS.ecommerce;
     loadLocalCache();
     state.dataLoaded = true;
     render();
-    if(state.scriptUrl){
+    if(ws){
       if(state.dirty){
         // há mudanças feitas neste aparelho que ainda não foram enviadas —
         // NUNCA sobrescrever sozinho com o que está na planilha.
@@ -328,7 +356,8 @@ async function init(){
 }
 
 async function refreshFromServer(silent){
-  if(!state.scriptUrl) return;
+  const ws = activeWorkspace();
+  if(!ws) return;
   if(!silent && state.dirty){
     const proceed = confirm('Você tem alterações não sincronizadas neste aparelho. Atualizar agora vai SUBSTITUÍ-LAS pelos dados da planilha. Deseja continuar mesmo assim?');
     if(!proceed) return;
@@ -344,7 +373,7 @@ async function refreshFromServer(silent){
     cacheLocally();
     state.syncState = 'ok';
     state.lastSync = new Date().toISOString();
-    if(!silent) showToast('Dados atualizados com a planilha compartilhada.');
+    if(!silent) showToast('Dados atualizados com a planilha de "'+ws.name+'".');
   }catch(e){
     state.syncState = 'error';
     showToast('Não foi possível ler a planilha (' + e.message + '). Mostrando a última cópia salva neste aparelho.');
@@ -353,8 +382,9 @@ async function refreshFromServer(silent){
 }
 
 async function pushToServer(){
-  if(!state.scriptUrl){
-    showToast('Configure a conexão com a planilha antes de salvar (botão de engrenagem).');
+  const ws = activeWorkspace();
+  if(!ws){
+    showToast('Configure uma área de trabalho antes de salvar (botão de engrenagem).');
     return false;
   }
   state.syncState = 'syncing'; render();
@@ -461,10 +491,16 @@ function syncBadge(){
     error:  {dot:'var(--red)', label:'Falha ao sincronizar'},
   };
   const s = map[state.syncState]||map.idle;
-  const title = state.scriptUrl ? '' : ' (conecte a planilha na engrenagem)';
+  const title = activeWorkspace() ? '' : ' (conecte uma planilha na engrenagem)';
   return `<span title="${title}" style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text-dim);white-space:nowrap;">
     <span style="width:7px;height:7px;border-radius:50%;background:${s.dot};display:inline-block;"></span>${s.label}
   </span>`;
+}
+function renderWorkspaceSwitcher(){
+  if(state.workspaces.length===0) return '';
+  return `<select id="workspaceSelect" title="Área de trabalho">
+    ${state.workspaces.map(w=>`<option value="${w.id}" ${w.id===state.activeWorkspaceId?'selected':''}>${w.name}</option>`).join('')}
+  </select>`;
 }
 
 function renderHeader(){
@@ -486,15 +522,15 @@ function renderHeader(){
       ${tabs.map(t=>`<button data-tab="${t.id}" class="${state.activeTab===t.id?'active':''}">${t.label}</button>`).join('')}
     </nav>
     <div class="topbar-actions">
+      ${renderWorkspaceSwitcher()}
       ${syncBadge()}
       <button class="btn btn-sm btn-ghost" id="refreshBtn" title="Buscar dados mais recentes da planilha" ${state.syncState==='syncing'?'disabled':''}>↻</button>
       <select id="periodSelect">
         <option value="all" ${state.period==='all'?'selected':''}>Todo o período</option>
         ${months.map(m=>`<option value="${m}" ${state.period===m?'selected':''}>${monthLabel(m)}</option>`).join('')}
       </select>
-      <button class="btn btn-ghost" id="exportBtn" ${state.syncState==='syncing'?'disabled':''}>Exportar Excel</button>
       <button class="btn btn-gold" id="openModalBtn" ${state.syncState==='syncing'?'disabled':''}>${state.syncState==='syncing'?'Salvando…':'Salvar'}</button>
-      <button class="btn btn-sm btn-ghost" id="openConfigBtn" title="Configurar conexão com a planilha">⚙</button>
+      <button class="btn btn-sm btn-ghost" id="openConfigBtn" title="Gerenciar áreas de trabalho">⚙</button>
     </div>
   </div></header>`;
 }
@@ -505,8 +541,19 @@ function attachHeaderEvents(){
   });
   document.getElementById('periodSelect').addEventListener('change', e=>{ state.period=e.target.value; render(); });
   document.getElementById('openModalBtn').addEventListener('click', ()=>{ state.modalOpen=true; render(); });
-  document.getElementById('openConfigBtn').addEventListener('click', ()=>{ state.configOpen=true; render(); });
+  document.getElementById('openConfigBtn').addEventListener('click', ()=>{ state.configOpen=true; state.configEditingId=null; render(); });
   document.getElementById('refreshBtn').addEventListener('click', ()=> refreshFromServer(false));
+  const wsSel = document.getElementById('workspaceSelect');
+  if(wsSel) wsSel.addEventListener('change', async e=>{
+    if(state.dirty){
+      const proceed = confirm('Você tem alterações não sincronizadas na área atual. Trocar de área agora vai deixá-las de lado até você voltar aqui e salvar. Continuar?');
+      if(!proceed){ wsSel.value = state.activeWorkspaceId; return; }
+    }
+    setActiveWorkspace(e.target.value);
+    state.period='all'; state.activeTab='lancamentos';
+    render();
+    refreshFromServer(true);
+  });
 }
 
 function renderTab(){
@@ -1056,39 +1103,91 @@ function recordHistory(action, note){
   return entry;
 }
 
-/* ================= CONFIGURAÇÃO: conexão com o Google Sheets ================= */
+/* ================= CONFIGURAÇÃO: áreas de trabalho (Lorian, Consultoria, etc.) ================= */
 function renderConfigModal(){
   if(!state.configOpen) return '';
+  const editing = state.configEditingId ? state.workspaces.find(w=>w.id===state.configEditingId) : null;
+  const showForm = !!state.configEditingId || state.workspaces.length===0;
+
+  const listHtml = state.workspaces.length===0 ? '' : `
+    <div style="margin-bottom:14px;">
+      ${state.workspaces.map(w=>`
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);">
+          <div style="flex:1;">
+            <div style="font-weight:600;">${w.name}</div>
+            <div style="font-size:11px;color:var(--text-dim);">${w.categoryPreset==='servicos'?'Categorias de Serviços':'Categorias de E-commerce'}</div>
+          </div>
+          <button class="btn btn-sm btn-ghost" data-edit-ws="${w.id}">Editar</button>
+          <button class="btn btn-sm btn-danger-ghost" data-del-ws="${w.id}">Remover</button>
+        </div>`).join('')}
+    </div>`;
+
+  const formHtml = !showForm ? `<button class="btn btn-gold btn-block" id="addWsBtn">+ Adicionar nova área</button>` : `
+    <div class="field">
+      <label>Nome da área</label>
+      <input type="text" id="wsNameInput" value="${editing?editing.name:''}" placeholder="Ex: Lorian, Consultoria da Camila…">
+    </div>
+    <div class="field">
+      <label>Tipo de categorias</label>
+      <select id="wsPresetInput">
+        <option value="ecommerce" ${(!editing||editing.categoryPreset==='ecommerce')?'selected':''}>E-commerce (vendas, frete, CMV…)</option>
+        <option value="servicos" ${editing?.categoryPreset==='servicos'?'selected':''}>Serviços/Consultoria (honorários, projetos…)</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>URL do Web App</label>
+      <input type="text" id="wsUrlInput" value="${editing?editing.scriptUrl:''}" placeholder="https://script.google.com/macros/s/…/exec">
+    </div>
+    <div class="field">
+      <label>Token secreto</label>
+      <input type="text" id="wsTokenInput" value="${editing?editing.scriptToken:''}" placeholder="o mesmo SECRET_TOKEN definido no script">
+    </div>
+    <button class="btn btn-gold btn-block" id="wsTestBtn" style="margin-bottom:8px;">Testar conexão</button>
+    <button class="btn btn-block" id="wsSaveBtn" style="margin-bottom:10px;">${editing?'Salvar alterações':'Adicionar e sincronizar'}</button>
+    <div id="wsResult" style="font-size:12.5px;color:var(--text-dim);min-height:18px;margin-bottom:4px;"></div>
+    ${state.workspaces.length>0?`<div class="modal-cancel-row"><button class="btn btn-ghost btn-sm" id="wsFormCancel">Voltar para a lista</button></div>`:''}
+  `;
+
   return `
   <div class="modal-overlay" id="configOverlay">
     <div class="modal">
-      <h3>Conectar à planilha compartilhada</h3>
-      <p>Cole a URL do Web App <strong>e</strong> o token secreto, separados (veja o guia de instalação). Isso conecta o app à planilha Google que guarda os dados de verdade, compartilhada pelos 3 sócios.</p>
-      <div class="field">
-        <label>URL do Web App</label>
-        <input type="text" id="configUrlInput" value="${state.scriptUrl}" placeholder="https://script.google.com/macros/s/…/exec">
-      </div>
-      <div class="field">
-        <label>Token secreto</label>
-        <input type="text" id="configTokenInput" value="${state.scriptToken}" placeholder="o mesmo SECRET_TOKEN definido no script">
-      </div>
-      <button class="btn btn-gold btn-block" id="configTestBtn" style="margin-bottom:8px;">Testar conexão</button>
-      <button class="btn btn-block" id="configSaveBtn" style="margin-bottom:10px;">Salvar e sincronizar agora</button>
-      <div id="configResult" style="font-size:12.5px;color:var(--text-dim);min-height:18px;margin-bottom:4px;"></div>
+      <h3>Áreas de trabalho</h3>
+      <p class="section-sub" style="margin-bottom:12px;">Cada área aponta para uma planilha própria — dados de áreas diferentes nunca se misturam. Compartilhe o link+token de cada área só com quem deve ver aqueles dados.</p>
+      ${listHtml}
+      ${formHtml}
       <div class="modal-cancel-row">
         <button class="btn btn-ghost btn-sm" id="configCancel">Fechar</button>
       </div>
     </div>
   </div>`;
 }
+
 function attachConfigEvents(){
   document.getElementById('configOverlay').addEventListener('click', e=>{ if(e.target.id==='configOverlay'){ state.configOpen=false; render(); } });
   document.getElementById('configCancel').addEventListener('click', ()=>{ state.configOpen=false; render(); });
 
-  document.getElementById('configTestBtn').addEventListener('click', async ()=>{
-    const url = document.getElementById('configUrlInput').value.trim();
-    const token = document.getElementById('configTokenInput').value.trim();
-    const box = document.getElementById('configResult');
+  const addBtn = document.getElementById('addWsBtn');
+  if(addBtn) addBtn.addEventListener('click', ()=>{ state.configEditingId = 'new'; render(); });
+
+  const cancelForm = document.getElementById('wsFormCancel');
+  if(cancelForm) cancelForm.addEventListener('click', ()=>{ state.configEditingId = null; render(); });
+
+  document.querySelectorAll('[data-edit-ws]').forEach(b=>b.addEventListener('click', ()=>{
+    state.configEditingId = b.dataset.editWs; render();
+  }));
+  document.querySelectorAll('[data-del-ws]').forEach(b=>b.addEventListener('click', ()=>{
+    const ws = state.workspaces.find(w=>w.id===b.dataset.delWs);
+    if(confirm(`Remover a área "${ws?.name}" deste aparelho? Isso não apaga a planilha, só esquece a conexão aqui.`)){
+      removeWorkspace(b.dataset.delWs);
+      render();
+    }
+  }));
+
+  const testBtn = document.getElementById('wsTestBtn');
+  if(testBtn) testBtn.addEventListener('click', async ()=>{
+    const url = document.getElementById('wsUrlInput').value.trim();
+    const token = document.getElementById('wsTokenInput').value.trim();
+    const box = document.getElementById('wsResult');
     if(!url || !token){ box.textContent = 'Preencha URL e token antes de testar.'; box.style.color='var(--red)'; return; }
     box.textContent = 'Testando…'; box.style.color = 'var(--text-dim)';
     try{
@@ -1104,11 +1203,20 @@ function attachConfigEvents(){
     }
   });
 
-  document.getElementById('configSaveBtn').addEventListener('click', async ()=>{
-    const url = document.getElementById('configUrlInput').value.trim();
-    const token = document.getElementById('configTokenInput').value.trim();
-    if(!url || !token){ showToast('Preencha a URL e o token antes de salvar.'); return; }
-    saveConfig(url, token);
+  const saveBtn = document.getElementById('wsSaveBtn');
+  if(saveBtn) saveBtn.addEventListener('click', async ()=>{
+    const name = document.getElementById('wsNameInput').value.trim();
+    const preset = document.getElementById('wsPresetInput').value;
+    const url = document.getElementById('wsUrlInput').value.trim();
+    const token = document.getElementById('wsTokenInput').value.trim();
+    if(!name || !url || !token){ showToast('Preencha nome, URL e token antes de salvar.'); return; }
+    const isNew = state.configEditingId==='new' || !state.workspaces.find(w=>w.id===state.configEditingId);
+    const id = isNew ? uid() : state.configEditingId;
+    upsertWorkspace({id, name, scriptUrl:url, scriptToken:token, categoryPreset:preset});
+    state.configEditingId = null;
+    if(isNew || state.activeWorkspaceId===id){
+      setActiveWorkspace(id);
+    }
     state.configOpen = false; render();
     await refreshFromServer(false);
   });
