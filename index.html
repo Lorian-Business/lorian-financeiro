@@ -141,29 +141,24 @@
 
   footer.foot{text-align:center;color:var(--text-dim);font-size:11.5px;margin-top:40px;}
 
-  .modal-overlay{
-    position:fixed;inset:0;background:rgba(6,6,7,.72);backdrop-filter:blur(2px);
-    display:flex;align-items:center;justify-content:center;z-index:60;padding:20px;
-  }
-  .modal-card{
-    background:var(--surface);border:1px solid var(--border);border-radius:14px;
-    padding:26px;max-width:420px;width:100%;box-shadow:0 20px 60px rgba(0,0,0,.5);
-  }
-  .modal-card h3{margin:0 0 6px;font-size:19px;}
-  .modal-card .field{margin:16px 0 6px;}
-  .modal-actions{display:flex;flex-direction:column;gap:8px;margin-top:18px;}
-  .modal-actions button{width:100%;padding:11px 14px;}
-  .modal-cancel-row{text-align:center;margin-top:10px;}
-  .modal-cancel-row button{background:transparent;border:none;color:var(--text-dim);font-size:12.5px;cursor:pointer;font-family:inherit;}
-  .modal-cancel-row button:hover{color:var(--text);}
   .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--surface-2);border:1px solid var(--gold);color:var(--text);padding:10px 18px;border-radius:8px;font-size:13px;z-index:60;opacity:0;pointer-events:none;transition:opacity .25s, transform .25s;}
   .toast.show{opacity:1;transform:translateX(-50%) translateY(-4px);}
   .loading{color:var(--text-dim);padding:40px;text-align:center;}
 
   /* ---------- modal ---------- */
-  .modal-overlay{position:fixed;inset:0;background:rgba(6,6,7,.72);display:flex;align-items:center;justify-content:center;z-index:50;padding:20px;}
+  .modal-overlay{
+    position:fixed;inset:0;background:rgba(6,6,7,.72);backdrop-filter:blur(2px);
+    display:flex;align-items:flex-start;justify-content:center;z-index:60;
+    padding:20px;overflow-y:auto;-webkit-overflow-scrolling:touch;
+  }
   .modal-overlay.hidden{display:none;}
-  .modal{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:24px;width:100%;max-width:440px;box-shadow:0 20px 60px rgba(0,0,0,.5);}
+  .modal{
+    background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);
+    padding:24px;width:100%;max-width:440px;box-shadow:0 20px 60px rgba(0,0,0,.5);
+    margin:auto 0; /* centers vertically when it fits, scrolls when it doesn't */
+    max-height:calc(100vh - 40px);overflow-y:auto;-webkit-overflow-scrolling:touch;
+    box-sizing:border-box;
+  }
   .modal h3{margin:0 0 6px;font-size:18px;}
   .modal p{color:var(--text-dim);font-size:12.5px;margin:0 0 16px;}
   .modal .field{display:flex;flex-direction:column;gap:5px;margin-bottom:16px;}
@@ -525,6 +520,7 @@ function renderHeader(){
       ${renderWorkspaceSwitcher()}
       ${syncBadge()}
       <button class="btn btn-sm btn-ghost" id="refreshBtn" title="Buscar dados mais recentes da planilha" ${state.syncState==='syncing'?'disabled':''}>↻</button>
+      ${activeWorkspace()?.mlEnabled ? `<button class="btn btn-sm btn-ghost" id="mlImportBtn" title="Importar vendas do Mercado Livre agora">🛒 Importar ML</button>` : ''}
       <select id="periodSelect">
         <option value="all" ${state.period==='all'?'selected':''}>Todo o período</option>
         ${months.map(m=>`<option value="${m}" ${state.period===m?'selected':''}>${monthLabel(m)}</option>`).join('')}
@@ -543,6 +539,20 @@ function attachHeaderEvents(){
   document.getElementById('openModalBtn').addEventListener('click', ()=>{ state.modalOpen=true; render(); });
   document.getElementById('openConfigBtn').addEventListener('click', ()=>{ state.configOpen=true; state.configEditingId=null; render(); });
   document.getElementById('refreshBtn').addEventListener('click', ()=> refreshFromServer(false));
+  const mlBtn = document.getElementById('mlImportBtn');
+  if(mlBtn) mlBtn.addEventListener('click', async ()=>{
+    mlBtn.disabled = true; mlBtn.textContent = 'Importando…';
+    try{
+      const res = await fetch(buildUrl_() + '&action=ml_import');
+      const data = await res.json();
+      if(data.ok===false) throw new Error(data.error||'falha desconhecida');
+      showToast(data.imported>0 ? `${data.imported} nova(s) venda(s) importada(s) do ML.` : 'Nenhuma venda nova encontrada.');
+      await refreshFromServer(true);
+    }catch(e){
+      showToast('Falha ao importar do ML: ' + e.message);
+    }
+    render();
+  });
   const wsSel = document.getElementById('workspaceSelect');
   if(wsSel) wsSel.addEventListener('change', async e=>{
     if(state.dirty){
@@ -1115,7 +1125,7 @@ function renderConfigModal(){
         <div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);">
           <div style="flex:1;">
             <div style="font-weight:600;">${w.name}</div>
-            <div style="font-size:11px;color:var(--text-dim);">${w.categoryPreset==='servicos'?'Categorias de Serviços':'Categorias de E-commerce'}</div>
+            <div style="font-size:11px;color:var(--text-dim);">${w.categoryPreset==='servicos'?'Categorias de Serviços':'Categorias de E-commerce'}${w.mlEnabled?' · 🛒 Mercado Livre conectado':''}</div>
           </div>
           <button class="btn btn-sm btn-ghost" data-edit-ws="${w.id}">Editar</button>
           <button class="btn btn-sm btn-danger-ghost" data-del-ws="${w.id}">Remover</button>
@@ -1141,6 +1151,10 @@ function renderConfigModal(){
     <div class="field">
       <label>Token secreto</label>
       <input type="text" id="wsTokenInput" value="${editing?editing.scriptToken:''}" placeholder="o mesmo SECRET_TOKEN definido no script">
+    </div>
+    <div class="field" style="flex-direction:row;align-items:center;gap:8px;">
+      <input type="checkbox" id="wsMlInput" ${editing?.mlEnabled?'checked':''} style="width:auto;">
+      <label style="text-transform:none;font-size:13px;color:var(--text);">Esta área tem integração com Mercado Livre</label>
     </div>
     <button class="btn btn-gold btn-block" id="wsTestBtn" style="margin-bottom:8px;">Testar conexão</button>
     <button class="btn btn-block" id="wsSaveBtn" style="margin-bottom:10px;">${editing?'Salvar alterações':'Adicionar e sincronizar'}</button>
@@ -1209,10 +1223,11 @@ function attachConfigEvents(){
     const preset = document.getElementById('wsPresetInput').value;
     const url = document.getElementById('wsUrlInput').value.trim();
     const token = document.getElementById('wsTokenInput').value.trim();
+    const mlEnabled = document.getElementById('wsMlInput').checked;
     if(!name || !url || !token){ showToast('Preencha nome, URL e token antes de salvar.'); return; }
     const isNew = state.configEditingId==='new' || !state.workspaces.find(w=>w.id===state.configEditingId);
     const id = isNew ? uid() : state.configEditingId;
-    upsertWorkspace({id, name, scriptUrl:url, scriptToken:token, categoryPreset:preset});
+    upsertWorkspace({id, name, scriptUrl:url, scriptToken:token, categoryPreset:preset, mlEnabled});
     state.configEditingId = null;
     if(isNew || state.activeWorkspaceId===id){
       setActiveWorkspace(id);
