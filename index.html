@@ -640,4 +640,754 @@ function renderLancamentos(){
       <select id="filterType">
         <option value="all">Todos os tipos</option>
         <option value="receita" ${state.filterType==='receita'?'selected':''}>Receitas</option>
-        <option value="despesa" ${state.filterType==='d
+        <option value="despesa" ${state.filterType==='despesa'?'selected':''}>Despesas</option>
+      </select>
+      <select id="filterCategory">
+        <option value="all">Todas as categorias</option>
+        ${CATEGORIES.map(c=>`<option value="${c.id}" ${state.filterCategory===c.id?'selected':''}>${c.label}</option>`).join('')}
+      </select>
+      <div class="spacer"></div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-dim);cursor:pointer;">
+        <input type="checkbox" id="groupByOrderToggle" ${state.groupByOrder?'checked':''} style="width:auto;">
+        Agrupar por pedido
+      </label>
+    </div>
+    ${list.length===0? `<div class="empty">Nenhum lançamento neste período. Adicione o primeiro acima.</div>` :
+      state.groupByOrder ? renderLancamentosGrouped(list) : renderLancamentosFlat(list)}
+  </section>`;
+}
+
+function renderLancamentosFlat(list){
+  return `
+    <table>
+      <thead><tr><th>Data</th><th>Tipo</th><th>Categoria</th><th>Descrição</th><th>NF</th><th>Sócio</th><th class="num">Valor</th><th></th></tr></thead>
+      <tbody>
+        ${list.map(t=>renderLancamentoRow(t)).join('')}
+      </tbody>
+    </table>`;
+}
+
+// Agrupa lançamentos que compartilham o mesmo orderId (ex: venda + taxa +
+// frete de um mesmo pedido do ML) sob um cabeçalho com o total líquido do
+// grupo. Lançamentos sem orderId (a maioria dos manuais) aparecem soltos,
+// normalmente, na ordem em que já apareceriam.
+function renderLancamentosGrouped(list){
+  const groups = [];       // [{orderId, items:[...]}]
+  const groupIndex = {};   // orderId -> índice em groups
+  const loose = [];        // itens sem orderId, mantêm a posição original
+
+  const order = []; // sequência de itens de renderização: {kind:'group', ref} | {kind:'single', tx}
+  list.forEach(t=>{
+    if(t.orderId){
+      if(groupIndex[t.orderId]===undefined){
+        groupIndex[t.orderId] = groups.length;
+        const g = {orderId:t.orderId, items:[]};
+        groups.push(g);
+        order.push({kind:'group', ref:g});
+      }
+      groups[groupIndex[t.orderId]].items.push(t);
+    }else{
+      order.push({kind:'single', tx:t});
+    }
+  });
+
+  const rowsHtml = order.map(entry=>{
+    if(entry.kind==='single') return renderLancamentoRow(entry.tx);
+    const g = entry.ref;
+    const liquido = g.items.reduce((s,t)=> s + (t.type==='receita'? t.value : -t.value), 0);
+    const header = `
+      <tr class="order-group-header">
+        <td colspan="6">Pedido #${g.orderId}</td>
+        <td class="num" style="color:${liquido>=0?'var(--green)':'var(--red)'}">líquido ${fmtMoney(liquido)}</td>
+        <td></td>
+      </tr>`;
+    const rows = g.items
+      .sort((a,b)=> a.type==='receita' ? -1 : (b.type==='receita' ? 1 : 0))
+      .map(t=>renderLancamentoRow(t, true)).join('');
+    return header + rows;
+  }).join('');
+
+  return `
+    <table>
+      <thead><tr><th>Data</th><th>Tipo</th><th>Categoria</th><th>Descrição</th><th>NF</th><th>Sócio</th><th class="num">Valor</th><th></th></tr></thead>
+      <tbody>${rowsHtml}</tbody>
+    </table>`;
+}
+
+function renderLancamentoRow(t, indented){
+  return `
+    <tr>
+      <td${indented?' style="padding-left:26px;"':''}>${fmtDate(t.date)}</td>
+      <td><span class="tag tag-${t.type}">${t.type==='receita'?'Receita':'Despesa'}</span></td>
+      <td>${catById(t.categoryId)?.label||'—'}</td>
+      <td>${t.description}</td>
+      <td>${t.nf? t.nf : '<span style="color:var(--text-dim)">—</span>'}</td>
+      <td>${t.partner||'<span style="color:var(--text-dim)">—</span>'}</td>
+      <td class="num" style="color:${t.type==='receita'?'var(--green)':'var(--red)'}">${fmtMoney(t.value)}</td>
+      <td style="white-space:nowrap;">
+        <button class="btn btn-sm btn-ghost" data-edit="${t.id}">Editar</button>
+        <button class="btn btn-sm btn-danger-ghost" data-del="${t.id}">Excluir</button>
+      </td>
+    </tr>`;
+}
+
+function fillCategoryOptions(selectedType, selectedCategory){
+  const sel = document.getElementById('fCategory');
+  const opts = CATEGORIES.filter(c=>c.type===selectedType);
+  sel.innerHTML = opts.map(c=>`<option value="${c.id}" ${c.id===selectedCategory?'selected':''}>${c.label}</option>`).join('');
+}
+
+function attachTabEvents(){
+  if(state.activeTab==='lancamentos'){
+    const editing = state.editingId ? state.transactions.find(t=>t.id===state.editingId) : null;
+    const typeSel = document.getElementById('fType');
+    fillCategoryOptions(typeSel.value, editing?editing.categoryId:null);
+    typeSel.addEventListener('change', ()=>fillCategoryOptions(typeSel.value,null));
+
+    document.getElementById('entryForm').addEventListener('submit', e=>{
+      e.preventDefault();
+      const fd = new FormData(e.target);
+      const payload = {
+        type: fd.get('type'),
+        categoryId: fd.get('categoryId'),
+        date: fd.get('date'),
+        value: parseFloat(fd.get('value')),
+        nf: fd.get('nf').trim(),
+        description: fd.get('description').trim(),
+        paymentMethod: fd.get('paymentMethod'),
+        partner: fd.get('partner').trim(),
+      };
+      if(!payload.value || payload.value<=0){ showToast('Informe um valor válido.'); return; }
+      if(state.editingId){
+        const idx = state.transactions.findIndex(t=>t.id===state.editingId);
+        state.transactions[idx] = {...state.transactions[idx], ...payload};
+        showToast('Lançamento atualizado.');
+      }else{
+        state.transactions.push({id:uid(), reconciled:false, bankNote:'', ...payload});
+        showToast('Lançamento adicionado.');
+      }
+      state.editingId = null;
+      touch(); render();
+    });
+    const cancelBtn = document.getElementById('cancelEdit');
+    if(cancelBtn) cancelBtn.addEventListener('click', ()=>{ state.editingId=null; render(); });
+
+    document.querySelectorAll('[data-edit]').forEach(b=>b.addEventListener('click',()=>{ state.editingId=b.dataset.edit; render(); }));
+    document.querySelectorAll('[data-del]').forEach(b=>b.addEventListener('click',()=>{
+      if(confirm('Excluir este lançamento?')){
+        state.transactions = state.transactions.filter(t=>t.id!==b.dataset.del);
+        touch(); render();
+      }
+    }));
+    document.getElementById('filterType').addEventListener('change', e=>{ state.filterType=e.target.value; render(); });
+    document.getElementById('filterCategory').addEventListener('change', e=>{ state.filterCategory=e.target.value; render(); });
+    document.getElementById('groupByOrderToggle').addEventListener('change', e=>{ state.groupByOrder=e.target.checked; render(); });
+  }
+
+  if(state.activeTab==='conciliacao') attachConciliacaoEvents();
+  if(state.activeTab==='historico') attachHistoricoEvents();
+}
+
+/* ================= CONCILIAÇÃO ================= */
+function renderConciliacao(){
+  const list = periodTransactions()
+    .filter(t=> state.filterRecStatus==='all'
+      || (state.filterRecStatus==='pendente' && !t.reconciled)
+      || (state.filterRecStatus==='conciliado' && t.reconciled))
+    .sort((a,b)=> b.date.localeCompare(a.date));
+  const totalPend = periodTransactions().filter(t=>!t.reconciled).length;
+  const totalConc = periodTransactions().filter(t=>t.reconciled).length;
+  const totalAll = periodTransactions().length || 1;
+  const pct = Math.round((totalConc/totalAll)*100);
+
+  return `
+  <div class="grid grid-4" style="margin-bottom:20px;">
+    <div class="kpi"><div class="label">Conciliados</div><div class="value pos">${totalConc}</div></div>
+    <div class="kpi"><div class="label">Pendentes</div><div class="value" style="color:var(--gold-soft)">${totalPend}</div></div>
+    <div class="kpi"><div class="label">% conciliado</div><div class="value">${pct}%</div></div>
+    <div class="kpi"><div class="label">Período</div><div class="value" style="font-size:16px;">${state.period==='all'?'Todo o período':monthLabel(state.period)}</div></div>
+  </div>
+  <section class="card">
+    <h2 class="section-title">Conciliação bancária</h2>
+    <p class="section-sub">Confira cada lançamento com o extrato do banco e marque como conciliado.</p>
+    <div class="toolbar">
+      <select id="filterRecStatus">
+        <option value="all">Todos</option>
+        <option value="pendente" ${state.filterRecStatus==='pendente'?'selected':''}>Pendentes</option>
+        <option value="conciliado" ${state.filterRecStatus==='conciliado'?'selected':''}>Conciliados</option>
+      </select>
+    </div>
+    ${list.length===0? `<div class="empty">Nenhum lançamento para este filtro.</div>` : `
+    <table>
+      <thead><tr><th>Data</th><th>Tipo</th><th>Descrição</th><th>Categoria</th><th class="num">Valor</th><th>Nota do extrato</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        ${list.map(t=>`
+          <tr>
+            <td>${fmtDate(t.date)}</td>
+            <td><span class="tag tag-${t.type}">${t.type==='receita'?'Receita':'Despesa'}</span></td>
+            <td>${t.description}</td>
+            <td>${catById(t.categoryId)?.label||'—'}</td>
+            <td class="num" style="color:${t.type==='receita'?'var(--green)':'var(--red)'}">${fmtMoney(t.value)}</td>
+            <td><input type="text" data-note="${t.id}" value="${t.bankNote||''}" placeholder="ref. do extrato" style="width:140px;"></td>
+            <td><span class="tag ${t.reconciled?'tag-conciliado':'tag-pendente'}">${t.reconciled?'Conciliado':'Pendente'}</span></td>
+            <td><button class="btn btn-sm ${t.reconciled?'btn-ghost':'btn-gold'}" data-toggle="${t.id}">${t.reconciled?'Desfazer':'Conciliar'}</button></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`}
+  </section>`;
+}
+function attachConciliacaoEvents(){
+  document.getElementById('filterRecStatus').addEventListener('change', e=>{ state.filterRecStatus=e.target.value; render(); });
+  document.querySelectorAll('[data-toggle]').forEach(b=>b.addEventListener('click', ()=>{
+    const t = state.transactions.find(t=>t.id===b.dataset.toggle);
+    t.reconciled = !t.reconciled;
+    touch(); render();
+  }));
+  document.querySelectorAll('[data-note]').forEach(inp=>inp.addEventListener('change', ()=>{
+    const t = state.transactions.find(t=>t.id===inp.dataset.note);
+    t.bankNote = inp.value;
+    touch();
+  }));
+}
+
+/* ================= DRE ================= */
+function renderDRE(){
+  const list = periodTransactions();
+  const d = dreData(list);
+  const row = (label, value, opts={}) => `
+    <tr>
+      <td style="padding-left:${opts.indent?'26px':'10px'};${opts.bold?'font-weight:700;':''}">${label}</td>
+      <td class="num" style="${opts.bold?'font-weight:700;':''};color:${value<0?'var(--red)':opts.bold?'var(--gold-soft)':'inherit'}">${opts.neg? '('+fmtMoney(Math.abs(value))+')' : fmtMoney(value)}</td>
+    </tr>`;
+
+  return `
+  <section class="card">
+    <h2 class="section-title">Demonstrativo de Resultado (DRE)</h2>
+    <p class="section-sub">${state.period==='all'?'Todo o período registrado':monthLabel(state.period)}</p>
+    <table>
+      <tbody>
+        ${row('Receita Bruta', d.receitaBruta, {bold:true})}
+        ${row('(-) Deduções sobre Vendas (impostos)', d.deducoes, {indent:true, neg:true})}
+        ${row('= Receita Líquida', d.receitaLiquida, {bold:true})}
+        ${row('(-) CMV — Custo de Mercadoria', d.cmv, {indent:true, neg:true})}
+        ${row('= Lucro Bruto', d.lucroBruto, {bold:true})}
+        ${row('(-) Despesas Operacionais', d.opex, {indent:true, neg:true})}
+        ${row('= Lucro Líquido do Período', d.lucroLiquido, {bold:true})}
+        ${row('(-) Retiradas de Sócios / Não Operacional', d.naoOperacional, {indent:true, neg:true})}
+        ${row('= Resultado Após Retiradas', d.resultadoFinal, {bold:true})}
+      </tbody>
+    </table>
+  </section>
+
+  <section class="card" style="margin-top:20px;">
+    <h2 class="section-title">Composição das Despesas Operacionais</h2>
+    <p class="section-sub">Onde o dinheiro está saindo neste período — <strong>apenas despesas operacionais</strong> (Frete, Marketing, Ferramentas, Administrativas etc). Impostos sobre Vendas e Retirada de Sócio não entram aqui porque já aparecem em linhas próprias da DRE acima. Para ver <strong>todas</strong> as despesas juntas, veja o Dashboard.</p>
+    ${renderCategoryBars(list.filter(t=>catById(t.categoryId)?.group==='operacional'))}
+  </section>`;
+}
+
+const CATEGORY_PALETTE = ['#c9a227','#d98c3d','#b2562f','#e3c363','#8a6f18','#c1584a','#9c6b2f','#e0a95c'];
+
+function renderCategoryBars(list){
+  const totals = {};
+  list.forEach(t=>{ totals[t.categoryId] = (totals[t.categoryId]||0) + t.value; });
+  const entries = Object.entries(totals).sort((a,b)=>b[1]-a[1]);
+  if(entries.length===0) return `<div class="empty">Sem despesas neste período.</div>`;
+  const max = Math.max(...entries.map(e=>e[1]));
+  const total = entries.reduce((s,e)=>s+e[1],0);
+  return entries.map(([catId,val],i)=>{
+    const pct = total>0 ? Math.round(val/total*100) : 0;
+    const color = CATEGORY_PALETTE[i % CATEGORY_PALETTE.length];
+    return `
+    <div class="bar-row">
+      <div>${catById(catId)?.label||catId}</div>
+      <div class="bar-track"><div class="bar-fill" style="width:${(val/max*100).toFixed(1)}%;background:${color};"></div></div>
+      <div class="num">${fmtMoney(val)} <span style="color:var(--text-dim);font-size:11px;">(${pct}%)</span></div>
+    </div>`;
+  }).join('');
+}
+
+/* ================= DASHBOARD ================= */
+// Em vez de sempre mostrar 12 meses fixos (a maioria vazios quando a base é
+// nova), mostra a partir do primeiro lançamento até o mês atual — no máximo
+// 12 meses, no mínimo 3 (para sempre dar algum contexto de tendência).
+function relevantMonths(){
+  const dates = state.transactions.map(t=>t.date.slice(0,7));
+  const now = new Date().toISOString().slice(0,7);
+  let arr;
+  if(dates.length===0){
+    arr=[]; const d=new Date();
+    for(let i=5;i>=0;i--){ const dt=new Date(d.getFullYear(), d.getMonth()-i, 1); arr.push(dt.toISOString().slice(0,7)); }
+    return arr;
+  }
+  const earliest = dates.sort()[0];
+  const [ey,em0] = earliest.split('-').map(Number);
+  const [ny,nm0] = now.split('-').map(Number);
+  arr = []; let y=ey, m=em0;
+  while(y<ny || (y===ny && m<=nm0)){
+    arr.push(`${y}-${String(m).padStart(2,'0')}`);
+    m++; if(m>12){ m=1; y++; }
+  }
+  if(arr.length>12) arr = arr.slice(arr.length-12);
+  while(arr.length<3){
+    const [fy,fm] = arr[0].split('-').map(Number);
+    let py=fy, pm=fm-1; if(pm<1){ pm=12; py--; }
+    arr.unshift(`${py}-${String(pm).padStart(2,'0')}`);
+  }
+  return arr;
+}
+function renderDashboard(){
+  const list = periodTransactions();
+  const d = dreData(list);
+  const months = relevantMonths();
+  const monthlyData = months.map(m=>{
+    const mt = state.transactions.filter(t=>t.date.slice(0,7)===m);
+    const receita = mt.filter(t=>t.type==='receita').reduce((s,t)=>s+t.value,0);
+    const despesa = mt.filter(t=>t.type==='despesa' && catById(t.categoryId)?.group!=='nao_operacional').reduce((s,t)=>s+t.value,0);
+    return {m, receita, despesa, margem: receita>0 ? ((receita-despesa)/receita*100) : 0};
+  });
+  const totalConc = list.filter(t=>t.reconciled).length;
+  const pctConc = list.length ? Math.round(totalConc/list.length*100) : 0;
+  const rangeLabel = months.length>1 ? `${monthLabel(months[0])} – ${monthLabel(months[months.length-1])}` : monthLabel(months[0]);
+
+  return `
+  <div class="grid grid-4" style="margin-bottom:20px;">
+    <div class="kpi"><div class="label">Faturamento</div><div class="value pos">${fmtMoney(d.receitaBruta)}</div><div class="sub">${state.period==='all'?'todo o período':monthLabel(state.period)}</div></div>
+    <div class="kpi"><div class="label">Despesas totais</div><div class="value neg">${fmtMoney(d.deducoes+d.cmv+d.opex)}</div><div class="sub">CMV + operacional + deduções</div></div>
+    <div class="kpi"><div class="label">Lucro líquido</div><div class="value ${d.lucroLiquido>=0?'pos':'neg'}">${fmtMoney(d.lucroLiquido)}</div><div class="sub">antes de retiradas</div></div>
+    <div class="kpi"><div class="label">% conciliado</div><div class="value">${pctConc}%</div><div class="sub">${totalConc} de ${list.length} lançamentos</div></div>
+  </div>
+
+  <section class="card" style="margin-bottom:20px;">
+    <h2 class="section-title">Receita x Despesa</h2>
+    <p class="section-sub">${rangeLabel}</p>
+    ${renderMonthlyChart(monthlyData)}
+  </section>
+
+  <div class="grid grid-2">
+    <section class="card">
+      <h2 class="section-title">Margem líquida</h2>
+      <p class="section-sub">Verde = lucro no mês · vermelho = prejuízo no mês</p>
+      ${renderMarginChart(monthlyData)}
+    </section>
+    <section class="card">
+      <h2 class="section-title">Despesas por categoria</h2>
+      <p class="section-sub">Todas as despesas do período (impostos, retiradas e operacionais juntos)</p>
+      ${renderCategoryBars(list.filter(t=>t.type==='despesa'))}
+    </section>
+  </div>`;
+}
+
+function renderMonthlyChart(data){
+  const w=1080, h=260, padL=44, padB=28, padT=14;
+  const max = Math.max(1, ...data.map(x=>Math.max(x.receita,x.despesa))) * 1.12;
+  const bw = (w-padL)/data.length;
+  const plotH = h-padB-padT;
+  const scaleY = v => plotH * (v/max);
+  const gridLines = [0,0.25,0.5,0.75,1].map(f=>{
+    const y = h-padB-plotH*f;
+    return `<line x1="${padL}" y1="${y}" x2="${w-4}" y2="${y}" stroke="var(--border)" stroke-width="1"/>
+            <text x="2" y="${y+3}" font-size="9" fill="var(--text-dim)">${f===0?'0':fmtMoneyShort(max*f)}</text>`;
+  }).join('');
+  let bars = '';
+  const currentMonth = new Date().toISOString().slice(0,7);
+  data.forEach((x,i)=>{
+    const cx = padL + i*bw;
+    const hr = scaleY(x.receita), hd = scaleY(x.despesa);
+    const gw = bw*0.32;
+    const isCurrent = x.m===currentMonth;
+    if(isCurrent) bars += `<rect x="${cx}" y="${padT}" width="${bw}" height="${plotH}" fill="rgba(201,162,39,.06)"/>`;
+    bars += `<rect x="${cx+bw*0.12}" y="${h-padB-hr}" width="${gw}" height="${Math.max(hr,hr>0?2:0)}" fill="var(--green)" rx="2"><title>Receita ${monthLabel(x.m)}: ${fmtMoney(x.receita)}</title></rect>`;
+    bars += `<rect x="${cx+bw*0.52}" y="${h-padB-hd}" width="${gw}" height="${Math.max(hd,hd>0?2:0)}" fill="var(--red)" rx="2"><title>Despesa ${monthLabel(x.m)}: ${fmtMoney(x.despesa)}</title></rect>`;
+    if(hr>18) bars += `<text x="${cx+bw*0.12+gw/2}" y="${h-padB-hr-4}" font-size="9" fill="var(--green)" text-anchor="middle">${fmtMoneyShort(x.receita)}</text>`;
+    if(hd>18) bars += `<text x="${cx+bw*0.52+gw/2}" y="${h-padB-hd-4}" font-size="9" fill="var(--red)" text-anchor="middle">${fmtMoneyShort(x.despesa)}</text>`;
+    bars += `<text x="${cx+bw/2}" y="${h-9}" font-size="9.5" fill="${isCurrent?'var(--gold-soft)':'var(--text-dim)'}" text-anchor="middle">${MONTH_NAMES[parseInt(x.m.slice(5),10)-1].slice(0,3)}/${x.m.slice(2,4)}</text>`;
+  });
+  return `
+  <div style="display:flex;gap:16px;font-size:11.5px;color:var(--text-dim);margin-bottom:8px;">
+    <span><span style="display:inline-block;width:9px;height:9px;background:var(--green);border-radius:2px;margin-right:5px;"></span>Receita</span>
+    <span><span style="display:inline-block;width:9px;height:9px;background:var(--red);border-radius:2px;margin-right:5px;"></span>Despesa</span>
+  </div>
+  <svg viewBox="0 0 ${w} ${h}" style="width:100%;height:auto;display:block;">${gridLines}${bars}</svg>`;
+}
+function fmtMoneyShort(v){
+  if(Math.abs(v)>=1000) return (v/1000).toLocaleString('pt-BR',{maximumFractionDigits:1})+'k';
+  return v.toLocaleString('pt-BR',{maximumFractionDigits:0});
+}
+
+function renderMarginChart(data){
+  const w=520, h=210, padL=38, padB=26, padT=16;
+  const vals = data.map(x=>x.margem);
+  const min = Math.min(0, ...vals), max = Math.max(10, ...vals);
+  const range = (max-min)||1;
+  const stepX = (w-padL-10)/(data.length-1||1);
+  const y = v => h-padB - ((v-min)/range)*(h-padB-padT);
+  const pts = data.map((x,i)=>({x:padL+i*stepX, y:y(x.margem), v:x.margem, m:x.m}));
+  const linePts = pts.map(p=>`${p.x},${p.y}`).join(' ');
+  const zeroY = y(0);
+  const areaPath = `M${pts[0].x},${zeroY} ` + pts.map(p=>`L${p.x},${p.y}`).join(' ') + ` L${pts[pts.length-1].x},${zeroY} Z`;
+  const gridTexts = [max, 0, min].filter((v,i,arr)=>arr.indexOf(v)===i).map(v=>{
+    const yy=y(v);
+    return `<line x1="${padL}" y1="${yy}" x2="${w-6}" y2="${yy}" stroke="var(--border)" stroke-dasharray="3,3"/>
+            <text x="2" y="${yy+3}" font-size="9" fill="var(--text-dim)">${v.toFixed(0)}%</text>`;
+  }).join('');
+  return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:auto;display:block;">
+    <defs>
+      <linearGradient id="marginFill" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="var(--gold)" stop-opacity=".35"/>
+        <stop offset="100%" stop-color="var(--gold)" stop-opacity="0"/>
+      </linearGradient>
+    </defs>
+    ${gridTexts}
+    <path d="${areaPath}" fill="url(#marginFill)"/>
+    <polyline points="${linePts}" fill="none" stroke="var(--gold)" stroke-width="2.5"/>
+    ${pts.map(p=>`<circle cx="${p.x}" cy="${p.y}" r="3.2" fill="${p.v>=0?'var(--green)':'var(--red)'}" stroke="var(--surface)" stroke-width="1.2"><title>${monthLabel(p.m)}: ${p.v.toFixed(1)}%</title></circle>`).join('')}
+    ${pts.map((p,i)=> (i===0||i===pts.length-1||pts.length<=6) ? `<text x="${p.x}" y="${h-6}" font-size="9" fill="var(--text-dim)" text-anchor="${i===0?'start':i===pts.length-1?'end':'middle'}">${p.m.slice(5)}/${p.m.slice(2,4)}</text>` : '').join('')}
+  </svg>`;
+}
+
+/* ================= HISTÓRICO ================= */
+function renderHistorico(){
+  const list = [...state.history].sort((a,b)=> b.timestamp.localeCompare(a.timestamp));
+  return `
+  <section class="card">
+    <div class="toolbar">
+      <div>
+        <h2 class="section-title" style="margin-bottom:2px;">Histórico de salvamentos e exportações</h2>
+        <p class="section-sub" style="margin-bottom:0;">Todo clique em "Salvar" ou "Exportar" fica registrado aqui — visível para os três sócios após sincronizar.</p>
+      </div>
+      <div class="spacer"></div>
+      ${list.length>0?`<button class="btn btn-sm btn-danger-ghost" id="clearHistBtn">Limpar histórico</button>`:''}
+    </div>
+    ${list.length===0? `<div class="empty">Nenhum registro ainda. Use o botão "Salvar / Exportar" no topo da página.</div>` : `
+    <table>
+      <thead><tr><th>Quando</th><th>Ação</th><th>Período</th><th class="num">Lançamentos</th><th class="num">Faturamento</th><th class="num">Despesas</th><th class="num">Lucro Líquido</th><th>Observação</th><th></th></tr></thead>
+      <tbody>
+        ${list.map(h=>`
+          <tr>
+            <td>${fmtDateTime(h.timestamp)}</td>
+            <td><span class="tag ${h.action==='exportar'?'tag-exportar':'tag-salvar'}">${h.action==='exportar'?'Exportado':'Salvo'}</span></td>
+            <td>${h.period==='all'?'Todo o período':monthLabel(h.period)}</td>
+            <td class="num">${h.totalLancamentos}</td>
+            <td class="num" style="color:var(--green)">${fmtMoney(h.receitaBruta)}</td>
+            <td class="num" style="color:var(--red)">${fmtMoney(h.despesasTotais)}</td>
+            <td class="num">${fmtMoney(h.lucroLiquido)}</td>
+            <td>${h.note||'<span style="color:var(--text-dim)">—</span>'}</td>
+            <td><button class="btn btn-sm btn-danger-ghost" data-del-hist="${h.id}">Excluir</button></td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`}
+  </section>`;
+}
+function attachHistoricoEvents(){
+  document.querySelectorAll('[data-del-hist]').forEach(b=>b.addEventListener('click', ()=>{
+    if(confirm('Excluir este registro do histórico?')){
+      state.history = state.history.filter(h=>h.id!==b.dataset.delHist);
+      touch(); render();
+    }
+  }));
+  const clearBtn = document.getElementById('clearHistBtn');
+  if(clearBtn) clearBtn.addEventListener('click', ()=>{
+    if(confirm('Apagar TODO o histórico de salvamentos/exportações? Isso não afeta os lançamentos.')){
+      state.history = [];
+      touch(); render();
+    }
+  });
+}
+
+/* ================= MODAL: SALVAR / EXPORTAR ================= */
+function renderModal(){
+  if(!state.modalOpen) return `<div class="modal-overlay hidden"></div>`;
+  const list = periodTransactions();
+  const d = dreData(list);
+  const periodLabel = state.period==='all' ? 'todo o período' : monthLabel(state.period);
+  const busy = !!state.modalBusy;
+  return `
+  <div class="modal-overlay" id="modalOverlay">
+    <div class="modal">
+      <h3>Salvar ou exportar?</h3>
+      <p class="section-sub" style="margin-bottom:12px;">
+        Isso vai enviar <strong>${list.length} lançamento(s)</strong> de <strong>${periodLabel}</strong>
+        (faturamento ${fmtMoney(d.receitaBruta)}, lucro líquido ${fmtMoney(d.lucroLiquido)})
+        para a planilha compartilhada. Confira antes de confirmar.
+      </p>
+      <div class="field">
+        <label>Observação (opcional)</label>
+        <input type="text" id="modalNote" placeholder="Ex: Fechamento de agosto" ${busy?'disabled':''}>
+      </div>
+      <button class="btn btn-block modal-option" id="modalSaveOnly" ${busy?'disabled style="opacity:.55"':''}>
+        <div class="opt-title">${busy==='salvar'?'Salvando…':'Apenas salvar no histórico'}</div>
+        <div class="opt-sub">Registra o snapshot, sem baixar arquivo</div>
+      </button>
+      <button class="btn btn-gold btn-block modal-option gold" id="modalExport" ${busy?'disabled style="opacity:.55"':''}>
+        <div class="opt-title">${busy==='exportar'?'Salvando e exportando…':'Salvar e exportar Excel'}</div>
+        <div class="opt-sub">Registra o snapshot e baixa a planilha para a contabilidade</div>
+      </button>
+      <div class="modal-cancel-row">
+        <button class="btn btn-ghost btn-sm" id="modalCancel" ${busy?'disabled':''}>Cancelar</button>
+      </div>
+    </div>
+  </div>`;
+}
+function attachModalEvents(){
+  document.getElementById('modalOverlay').addEventListener('click', e=>{ if(e.target.id==='modalOverlay' && !state.modalBusy){ state.modalOpen=false; render(); } });
+  const cancelBtn = document.getElementById('modalCancel');
+  if(cancelBtn) cancelBtn.addEventListener('click', ()=>{ if(state.modalBusy) return; state.modalOpen=false; render(); });
+
+  const saveBtn = document.getElementById('modalSaveOnly');
+  const exportBtn = document.getElementById('modalExport');
+  if(saveBtn) saveBtn.addEventListener('click', async ()=>{
+    if(state.modalBusy) return;
+    const note = document.getElementById('modalNote').value.trim();
+    state.modalBusy = 'salvar'; render();
+    recordHistory('salvar', note);
+    const ok = await pushToServer();
+    state.modalBusy = false; state.modalOpen = false; render();
+    showToast(ok ? 'Salvo e sincronizado com a planilha.' : 'Salvo neste aparelho — sincronização falhou.');
+  });
+  if(exportBtn) exportBtn.addEventListener('click', async ()=>{
+    if(state.modalBusy) return;
+    const note = document.getElementById('modalNote').value.trim();
+    state.modalBusy = 'exportar'; render();
+    recordHistory('exportar', note);
+    const ok = await pushToServer();
+    exportExcel();
+    state.modalBusy = false; state.modalOpen = false; render();
+    showToast(ok ? 'Exportado e sincronizado com a planilha.' : 'Excel exportado, mas a sincronização falhou.');
+  });
+}
+
+/* ================= HISTÓRICO: registrar snapshot (localmente; some para o servidor no próximo pushToServer) ================= */
+function recordHistory(action, note){
+  const list = periodTransactions();
+  const d = dreData(list);
+  const entry = {
+    id: uid(),
+    timestamp: new Date().toISOString(),
+    action,
+    period: state.period,
+    totalLancamentos: list.length,
+    receitaBruta: d.receitaBruta,
+    despesasTotais: d.deducoes + d.cmv + d.opex,
+    lucroLiquido: d.lucroLiquido,
+    note: note || '',
+  };
+  state.history.unshift(entry);
+  touch();
+  return entry;
+}
+
+/* ================= CONFIGURAÇÃO: áreas de trabalho (Lorian, Consultoria, etc.) ================= */
+function renderConfigModal(){
+  if(!state.configOpen) return '';
+  const editing = state.configEditingId ? state.workspaces.find(w=>w.id===state.configEditingId) : null;
+  const showForm = !!state.configEditingId || state.workspaces.length===0;
+
+  const listHtml = state.workspaces.length===0 ? '' : `
+    <div style="margin-bottom:14px;">
+      ${state.workspaces.map(w=>`
+        <div style="display:flex;align-items:center;gap:8px;padding:8px 0;border-bottom:1px solid var(--border);">
+          <div style="flex:1;">
+            <div style="font-weight:600;">${w.name}</div>
+            <div style="font-size:11px;color:var(--text-dim);">${w.categoryPreset==='servicos'?'Categorias de Serviços':'Categorias de E-commerce'}${w.mlEnabled?' · 🛒 Mercado Livre conectado':''}</div>
+          </div>
+          <button class="btn btn-sm btn-ghost" data-edit-ws="${w.id}">Editar</button>
+          <button class="btn btn-sm btn-danger-ghost" data-del-ws="${w.id}">Remover</button>
+        </div>`).join('')}
+    </div>`;
+
+  const formHtml = !showForm ? `<button class="btn btn-gold btn-block" id="addWsBtn">+ Adicionar nova área</button>` : `
+    <div class="field">
+      <label>Nome da área</label>
+      <input type="text" id="wsNameInput" value="${editing?editing.name:''}" placeholder="Ex: Lorian, Consultoria da Camila…">
+    </div>
+    <div class="field">
+      <label>Tipo de categorias</label>
+      <select id="wsPresetInput">
+        <option value="ecommerce" ${(!editing||editing.categoryPreset==='ecommerce')?'selected':''}>E-commerce (vendas, frete, CMV…)</option>
+        <option value="servicos" ${editing?.categoryPreset==='servicos'?'selected':''}>Serviços/Consultoria (honorários, projetos…)</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>URL do Web App</label>
+      <input type="text" id="wsUrlInput" value="${editing?editing.scriptUrl:''}" placeholder="https://script.google.com/macros/s/…/exec">
+    </div>
+    <div class="field">
+      <label>Token secreto</label>
+      <input type="text" id="wsTokenInput" value="${editing?editing.scriptToken:''}" placeholder="o mesmo SECRET_TOKEN definido no script">
+    </div>
+    <div class="field" style="flex-direction:row;align-items:center;gap:8px;">
+      <input type="checkbox" id="wsMlInput" ${editing?.mlEnabled?'checked':''} style="width:auto;">
+      <label style="text-transform:none;font-size:13px;color:var(--text);">Esta área tem integração com Mercado Livre</label>
+    </div>
+    <button class="btn btn-gold btn-block" id="wsTestBtn" style="margin-bottom:8px;">Testar conexão</button>
+    <button class="btn btn-block" id="wsSaveBtn" style="margin-bottom:10px;">${editing?'Salvar alterações':'Adicionar e sincronizar'}</button>
+    <div id="wsResult" style="font-size:12.5px;color:var(--text-dim);min-height:18px;margin-bottom:4px;"></div>
+    ${state.workspaces.length>0?`<div class="modal-cancel-row"><button class="btn btn-ghost btn-sm" id="wsFormCancel">Voltar para a lista</button></div>`:''}
+  `;
+
+  return `
+  <div class="modal-overlay" id="configOverlay">
+    <div class="modal">
+      <h3>Áreas de trabalho</h3>
+      <p class="section-sub" style="margin-bottom:12px;">Cada área aponta para uma planilha própria — dados de áreas diferentes nunca se misturam. Compartilhe o link+token de cada área só com quem deve ver aqueles dados.</p>
+      ${listHtml}
+      ${formHtml}
+      <div class="modal-cancel-row">
+        <button class="btn btn-ghost btn-sm" id="configCancel">Fechar</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function attachConfigEvents(){
+  document.getElementById('configOverlay').addEventListener('click', e=>{ if(e.target.id==='configOverlay'){ state.configOpen=false; render(); } });
+  document.getElementById('configCancel').addEventListener('click', ()=>{ state.configOpen=false; render(); });
+
+  const addBtn = document.getElementById('addWsBtn');
+  if(addBtn) addBtn.addEventListener('click', ()=>{ state.configEditingId = 'new'; render(); });
+
+  const cancelForm = document.getElementById('wsFormCancel');
+  if(cancelForm) cancelForm.addEventListener('click', ()=>{ state.configEditingId = null; render(); });
+
+  document.querySelectorAll('[data-edit-ws]').forEach(b=>b.addEventListener('click', ()=>{
+    state.configEditingId = b.dataset.editWs; render();
+  }));
+  document.querySelectorAll('[data-del-ws]').forEach(b=>b.addEventListener('click', ()=>{
+    const ws = state.workspaces.find(w=>w.id===b.dataset.delWs);
+    if(confirm(`Remover a área "${ws?.name}" deste aparelho? Isso não apaga a planilha, só esquece a conexão aqui.`)){
+      removeWorkspace(b.dataset.delWs);
+      render();
+    }
+  }));
+
+  const testBtn = document.getElementById('wsTestBtn');
+  if(testBtn) testBtn.addEventListener('click', async ()=>{
+    const url = document.getElementById('wsUrlInput').value.trim();
+    const token = document.getElementById('wsTokenInput').value.trim();
+    const box = document.getElementById('wsResult');
+    if(!url || !token){ box.textContent = 'Preencha URL e token antes de testar.'; box.style.color='var(--red)'; return; }
+    box.textContent = 'Testando…'; box.style.color = 'var(--text-dim)';
+    try{
+      const sep = url.includes('?') ? '&' : '?';
+      const res = await fetch(url + sep + 'token=' + encodeURIComponent(token));
+      const data = await res.json();
+      if(data.ok===false || data.error) throw new Error(data.error||'acesso negado');
+      box.textContent = `Conectado! ${(data.transactions||[]).length} lançamento(s) e ${(data.history||[]).length} registro(s) de histórico encontrados na planilha.`;
+      box.style.color = 'var(--green)';
+    }catch(e){
+      box.textContent = 'Falha: ' + e.message + '. Confira se o token bate com o SECRET_TOKEN do script e se você reimplantou uma "Nova versão" depois de editar.';
+      box.style.color = 'var(--red)';
+    }
+  });
+
+  const saveBtn = document.getElementById('wsSaveBtn');
+  if(saveBtn) saveBtn.addEventListener('click', async ()=>{
+    const name = document.getElementById('wsNameInput').value.trim();
+    const preset = document.getElementById('wsPresetInput').value;
+    const url = document.getElementById('wsUrlInput').value.trim();
+    const token = document.getElementById('wsTokenInput').value.trim();
+    const mlEnabled = document.getElementById('wsMlInput').checked;
+    if(!name || !url || !token){ showToast('Preencha nome, URL e token antes de salvar.'); return; }
+    const isNew = state.configEditingId==='new' || !state.workspaces.find(w=>w.id===state.configEditingId);
+    const id = isNew ? uid() : state.configEditingId;
+    upsertWorkspace({id, name, scriptUrl:url, scriptToken:token, categoryPreset:preset, mlEnabled});
+    state.configEditingId = null;
+    if(isNew || state.activeWorkspaceId===id){
+      setActiveWorkspace(id);
+    }
+    state.configOpen = false; render();
+    await refreshFromServer(false);
+  });
+}
+
+/* ================= EXPORT EXCEL ================= */
+const CURRENCY_FMT = '"R$" #,##0.00';
+
+// Aplica formato de moeda a colunas específicas (por rótulo do cabeçalho) de
+// uma planilha gerada por XLSX.utils.json_to_sheet.
+function applyCurrencyFormat_(ws, headerLabels, moneyLabels, numRows){
+  moneyLabels.forEach(label=>{
+    const colIdx = headerLabels.indexOf(label);
+    if(colIdx===-1) return;
+    const colLetter = XLSX.utils.encode_col(colIdx);
+    for(let r=0;r<numRows;r++){
+      const ref = colLetter + (r+2); // +2: linha 1 é o cabeçalho
+      if(ws[ref]) ws[ref].z = CURRENCY_FMT;
+    }
+  });
+}
+
+function exportExcel(){
+  const list = periodTransactions().sort((a,b)=>a.date.localeCompare(b.date));
+  if(list.length===0){ showToast('Não há lançamentos para exportar neste período.'); return; }
+
+  const rows = list.map(t=>({
+    'Data': fmtDate(t.date),
+    'Tipo': t.type==='receita'?'Receita':'Despesa',
+    'Categoria': catById(t.categoryId)?.label||'',
+    'Descrição': t.description,
+    'Nº NF': t.nf||'',
+    'Nº Pedido': t.orderId||'',
+    'Valor': t.value,
+    'Forma de Pagamento': t.paymentMethod||'',
+    'Sócio': t.partner||'',
+    'Conciliado': t.reconciled?'Sim':'Não',
+    'Nota do Extrato': t.bankNote||'',
+  }));
+  const txHeaders = ['Data','Tipo','Categoria','Descrição','Nº NF','Nº Pedido','Valor','Forma de Pagamento','Sócio','Conciliado','Nota do Extrato'];
+  const ws = XLSX.utils.json_to_sheet(rows, {header:txHeaders});
+  ws['!cols'] = [{wch:11},{wch:9},{wch:24},{wch:32},{wch:10},{wch:14},{wch:12},{wch:16},{wch:14},{wch:11},{wch:18}];
+  applyCurrencyFormat_(ws, txHeaders, ['Valor'], rows.length);
+
+  // Resumo mensal — visão geral de TODOS os meses lançados, independente do
+  // filtro de período selecionado no momento da exportação.
+  const monthsAll = Array.from(new Set(state.transactions.map(t=>t.date.slice(0,7)))).sort();
+  const resumoRows = monthsAll.map(m=>{
+    const mt = state.transactions.filter(t=>t.date.slice(0,7)===m);
+    const d = dreData(mt);
+    return {
+      'Mês': monthLabel(m),
+      'Faturamento': d.receitaBruta,
+      'Deduções': d.deducoes,
+      'CMV': d.cmv,
+      'Despesas Operacionais': d.opex,
+      'Retiradas': d.naoOperacional,
+      'Lucro Líquido': d.lucroLiquido,
+      'Lançamentos': mt.length,
+    };
+  });
+  const resumoHeaders = ['Mês','Faturamento','Deduções','CMV','Despesas Operacionais','Retiradas','Lucro Líquido','Lançamentos'];
+  const wsResumo = XLSX.utils.json_to_sheet(resumoRows, {header:resumoHeaders});
+  wsResumo['!cols'] = [{wch:16},{wch:14},{wch:12},{wch:12},{wch:20},{wch:12},{wch:14},{wch:12}];
+  applyCurrencyFormat_(wsResumo, resumoHeaders, ['Faturamento','Deduções','CMV','Despesas Operacionais','Retiradas','Lucro Líquido'], resumoRows.length);
+
+  const histRows = [...state.history].sort((a,b)=>b.timestamp.localeCompare(a.timestamp)).map(h=>({
+    'Quando': fmtDateTime(h.timestamp),
+    'Ação': h.action==='exportar'?'Exportado':'Salvo',
+    'Período': h.period==='all'?'Todo o período':monthLabel(h.period),
+    'Lançamentos': h.totalLancamentos,
+    'Faturamento': h.receitaBruta,
+    'Despesas': h.despesasTotais,
+    'Lucro Líquido': h.lucroLiquido,
+    'Observação': h.note||'',
+  }));
+  const histHeaders = ['Quando','Ação','Período','Lançamentos','Faturamento','Despesas','Lucro Líquido','Observação'];
+  const wsHist = XLSX.utils.json_to_sheet(histRows, {header:histHeaders});
+  wsHist['!cols'] = [{wch:17},{wch:10},{wch:16},{wch:12},{wch:14},{wch:14},{wch:14},{wch:26}];
+  applyCurrencyFormat_(wsHist, histHeaders, ['Faturamento','Despesas','Lucro Líquido'], histRows.length);
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Lançamentos');
+  XLSX.utils.book_append_sheet(wb, wsResumo, 'Resumo Mensal');
+  XLSX.utils.book_append_sheet(wb, wsHist, 'Histórico');
+
+  const label = state.period==='all' ? 'todos' : state.period;
+  XLSX.writeFile(wb, `lorian-financeiro-${label}.xlsx`);
+}
+
+/* ================= INIT ================= */
+init();
+</script>
+</body>
+</html>
