@@ -1140,20 +1140,22 @@ function attachModalEvents(){
     if(state.modalBusy) return;
     const note = document.getElementById('modalNote').value.trim();
     state.modalBusy = 'salvar'; render();
-    recordHistory('salvar', note);
+    const entry = recordHistory('salvar', note);
     const ok = await pushToServer();
     state.modalBusy = false; state.modalOpen = false; render();
-    showToast(ok ? 'Salvo e sincronizado com a planilha.' : 'Salvo neste aparelho — sincronização falhou.');
+    if(!ok) showToast('Salvo neste aparelho — sincronização falhou.');
+    else showToast(entry ? 'Salvo e sincronizado com a planilha.' : 'Sincronizado — nada mudou desde o último salvamento, histórico não duplicado.');
   });
   if(exportBtn) exportBtn.addEventListener('click', async ()=>{
     if(state.modalBusy) return;
     const note = document.getElementById('modalNote').value.trim();
     state.modalBusy = 'exportar'; render();
-    recordHistory('exportar', note);
+    const entry = recordHistory('exportar', note);
     const ok = await pushToServer();
     exportExcel();
     state.modalBusy = false; state.modalOpen = false; render();
-    showToast(ok ? 'Exportado e sincronizado com a planilha.' : 'Excel exportado, mas a sincronização falhou.');
+    if(!ok) showToast('Excel exportado, mas a sincronização falhou.');
+    else showToast(entry ? 'Exportado e sincronizado com a planilha.' : 'Excel exportado — nada mudou desde o último salvamento, histórico não duplicado.');
   });
 }
 
@@ -1161,6 +1163,22 @@ function attachModalEvents(){
 function recordHistory(action, note){
   const list = periodTransactions();
   const d = dreData(list);
+  const despesasTotais = d.deducoes + d.cmv + d.opex;
+
+  // Evita registrar uma linha nova no Histórico se nada mudou desde o
+  // último salvamento (ex: clicar em "Salvar" várias vezes seguidas sem
+  // alterar nenhum lançamento).
+  const last = state.history[0];
+  const isSameAsLast = last &&
+    last.action === action &&
+    last.period === state.period &&
+    last.totalLancamentos === list.length &&
+    Math.abs(last.receitaBruta - d.receitaBruta) < 0.005 &&
+    Math.abs(last.despesasTotais - despesasTotais) < 0.005 &&
+    Math.abs(last.lucroLiquido - d.lucroLiquido) < 0.005 &&
+    (last.note||'') === (note||'');
+  if(isSameAsLast) return null;
+
   const entry = {
     id: uid(),
     timestamp: new Date().toISOString(),
@@ -1168,7 +1186,7 @@ function recordHistory(action, note){
     period: state.period,
     totalLancamentos: list.length,
     receitaBruta: d.receitaBruta,
-    despesasTotais: d.deducoes + d.cmv + d.opex,
+    despesasTotais: despesasTotais,
     lucroLiquido: d.lucroLiquido,
     note: note || '',
   };
